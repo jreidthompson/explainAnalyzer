@@ -129,7 +129,8 @@ def seq_scan_filter(plan: Plan, cfg: Config) -> list[Finding]:
         if removed < cfg.filter_min_removed or removed / max(removed + kept, 1) < cfg.filter_ratio:
             continue
         pct = removed / max(removed + kept, 1) * 100
-        sev = CRIT if n.m["excl_pct"] >= cfg.hot_warn_pct else WARN
+        sev = CRIT if n.m["excl_pct"] >= cfg.hot_warn_pct else \
+            WARN if n.m["excl_pct"] >= cfg.hot_info_pct else INFO
         out.append(Finding(
             "seq-scan-filter", sev, "Sequential scan discards most rows",
             f"{_where(n)} read {_fmt_rows(removed + kept)} rows and kept {_fmt_rows(kept)} ({pct:.1f}% discarded). "
