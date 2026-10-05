@@ -94,6 +94,19 @@ Nested Loop  (cost=0.00..10.00 rows=1 width=4) (actual time=0.1..0.1 rows=0 loop
         (p, _), = analyze_text(txt)
         self.assertTrue(p.nodes[2].m["never"])
 
+    def test_psql_noise_before_and_after_plan(self):
+        body = (FIX / "real_nl.txt").read_text()
+        for pre, post in (("BEGIN\nSET\n", "ROLLBACK\n"), ("Timing is on.\n", "Time: 3.2 ms\n")):
+            (p, _), = analyze_text(pre + body + post)
+            self.assertTrue(p.m["analyzed"])
+            self.assertEqual(p.root.node_type, "Nested Loop")
+            self.assertEqual(len(p.nodes), 3)
+
+    def test_costs_off_plan_still_parses(self):
+        txt = "Nested Loop\n  ->  Seq Scan on a\n  ->  Index Scan using i on b\n        Index Cond: (id = a.id)\n"
+        (p, _), = analyze_text(txt)
+        self.assertEqual([n.node_type for n in p.nodes], ["Nested Loop", "Seq Scan", "Index Scan"])
+
     def test_two_plans_in_one_input(self):
         one = "Seq Scan on t  (cost=0.00..1.00 rows=1 width=4) (actual time=0.1..0.1 rows=1 loops=1)\nExecution Time: 1 ms\n"
         res = analyze_text(one + one)

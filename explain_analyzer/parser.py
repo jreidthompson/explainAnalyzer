@@ -277,6 +277,7 @@ def parse_text(text: str) -> list[Plan]:
     section: str | None = None
     finished = False  # saw Planning/Execution Time for the current plan
     jit_lines: list[str] = []
+    has_cost = bool(_COST.search(text))
 
     def flush_jit() -> None:
         if plan is not None and jit_lines:
@@ -322,8 +323,9 @@ def parse_text(text: str) -> list[Plan]:
         indent, arrow, body = len(am.group(1)), am.group(2), am.group(3)
         col = indent + len(arrow or "")
         is_node = bool(arrow) or bool(_COST.search(body))
-        if not is_node and plan is None and not _LABEL.match(body) and ":" not in body.split("(")[0]:
-            is_node = True  # root of a COSTS OFF plan
+        if not is_node and plan is None and not has_cost and not _LABEL.match(body) \
+                and ":" not in body.split("(")[0]:
+            is_node = True  # root of a COSTS OFF plan (only when no line carries costs)
         if not is_node and finished and plan is not None and indent == 0 and _COST.search(body):
             is_node = True
 
