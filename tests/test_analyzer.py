@@ -290,3 +290,35 @@ class ContextTests(unittest.TestCase):
         self.assertIn("| On: (c.id = o.customer_id)", report_text.render(p, f))
         self.assertIn("(c.id = o.customer_id)", report_html.render(p, f))
         self.assertIn("(c.id = o.customer_id)", json.dumps(report_html.build_data(p, f)))
+
+
+class HashBatchTests(unittest.TestCase):
+    SETTINGS = {"Settings": {"work_mem": "6GB", "hash_mem_multiplier": "4"}}
+
+    def _hash_plan(self, **hash_props):
+        scan = N("Seq Scan", rows=5_000_000_000, act=40_000, total=5.0, **{"Relation Name": "big"})
+        h = N("Hash", rows=5_000_000_000, act=40_000, total=6.0, children=[scan],
+              **{"Plan Width": 100, "Peak Memory Usage": 95232, **hash_props})
+        probe = N("Seq Scan", rows=10, act=10, **{"Relation Name": "p"})
+        return run(N("Hash Join", rows=10, act=10, total=20.0, children=[probe, h]), **self.SETTINGS)
+
+    def test_planned_batches_blamed_on_estimate_not_work_mem(self):
+        p, f = self._hash_plan(**{"Hash Batches": 64, "Original Hash Batches": 64})
+        h = next(x for x in f if x.rule == "hash-spill")
+        self.assertNotIn("exceeded work_mem", h.detail)
+        self.assertIn("before execution started", h.title)
+        self.assertIn("24.0 GB", h.detail)          # 6GB x 4
+        self.assertIn("over-estimated", h.suggestion)
+
+    def test_runtime_growth_reported_as_memory_pressure(self):
+        p, f = self._hash_plan(**{"Hash Batches": 64, "Original Hash Batches": 1})
+        h = next(x for x in f if x.rule == "hash-spill")
+        self.assertIn("grew from 1 to 64", h.title)
+
+    def test_text_originally_notation(self):
+        txt = """\
+Hash  (cost=1.00..2.00 rows=100 width=4) (actual time=1.0..2.0 rows=100 loops=1)
+  Buckets: 1024 (originally 1024)  Batches: 64 (originally 8)  Memory Usage: 93000kB
+"""
+        (p, _), = analyze_text(txt)
+        self.assertEqual((p.root.get("Hash Batches"), p.root.get("Original Hash Batches")), (64, 8))

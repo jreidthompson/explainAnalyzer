@@ -32,6 +32,8 @@ def _fmt_rows(x: float) -> str:
 
 
 def _fmt_kb(kb: float) -> str:
+    if kb >= 1024 ** 2:
+        return f"{kb / 1024 ** 2:.1f} GB"
     return f"{kb / 1024:.1f} MB" if kb >= 1024 else f"{kb:.0f} kB"
 
 
@@ -182,6 +184,61 @@ def rows_removed(plan: Plan, cfg: Config) -> list[Finding]:
     return out
 
 
+def _hash_batches(plan: Plan, n: Node, batches: int) -> Finding:
+    orig = n.get("Original Hash Batches") or batches
+    peak = n.get("Peak Memory Usage") or 0
+    limit = plan.m.get("hash_mem_kb")
+    wm, mult = plan.m.get("work_mem_kb"), plan.m.get("hash_mem_multiplier")
+    parallel = bool(n.get("Parallel Aware"))
+    lim_txt = None
+    if limit is not None:
+        lim_txt = f"{_fmt_kb(limit)} (work_mem {_fmt_kb(wm)} x hash_mem_multiplier {mult:g})"
+    elif wm is not None:
+        lim_txt = f"at least work_mem {_fmt_kb(wm)} (hash_mem_multiplier not reported)"
+    child = next((c for c in n.children if not c.is_subplan_child()), None)
+    est_rows, width = n.m["est_rows"], n.get("Plan Width") or 0
+    act_total = n.m["rows_total"]
+    est_bytes_kb = est_rows * (width + 24) / 1024  # rough: tuple header + data per row
+    lines = []
+    if orig < batches:
+        kind = f"grew from {orig} to {batches} batches during execution"
+        lines.append(f"The hash table outgrew its memory limit while it was being built (peak {_fmt_kb(peak)}).")
+        sug = ("Raise work_mem / hash_mem_multiplier for this query, or shrink the build side "
+               "(filter earlier, narrower columns, better row estimate).")
+    else:
+        kind = f"{batches} batches were chosen before execution started"
+        lines.append(
+            "The number of batches was fixed from the planner's size estimate for the build side, "
+            "not because memory ran out while building (batches did not grow during execution).")
+        lines.append(f"Estimate: ~{_fmt_rows(est_rows)} rows x {width} B width = roughly {_fmt_kb(est_bytes_kb)}"
+                     + (f"; actual build rows: {_fmt_rows(act_total)}." if plan.m["analyzed"] else "."))
+        sug = ""
+        if plan.m["analyzed"] and est_rows > 0 and act_total * 10 < est_rows:
+            sug = (f"The build side was over-estimated {est_rows / max(act_total, 1):,.0f}x, which is what forced "
+                   "batching. Fix that estimate (ANALYZE, extended statistics, check the join/filter on the child "
+                   "node) and the join will stay in one batch.")
+        elif limit is not None and peak and peak < limit * 0.5:
+            sug = (f"Peak memory ({_fmt_kb(peak)}) is far below the limit, so the estimate (not the data) is "
+                   "driving this: compare the Hash node's estimated rows/width with the actual, and check the "
+                   "work_mem and hash_mem_multiplier in effect for the session that executes the query "
+                   "(role/database settings, connection pooler, a setting changed after the plan was captured).")
+        else:
+            sug = ("Compare the Hash node's estimated rows/width with what it actually received; if the estimate is "
+                   "right, raise work_mem / hash_mem_multiplier for this query.")
+    if lim_txt:
+        lines.append(f"Memory limit for hash tables: {lim_txt}; peak used {_fmt_kb(peak)}.")
+    else:
+        lines.append(f"Peak memory used {_fmt_kb(peak)}. work_mem was not reported in the plan "
+                     "(capture with EXPLAIN (SETTINGS) to see non-default values).")
+    if parallel:
+        lines.append("This is a Parallel Hash; the table is shared by the workers.")
+    tw = n.m["buf_excl"].get("Temp Written Blocks", 0) + (n.parent.m["buf_excl"].get("Temp Written Blocks", 0) if n.parent else 0)
+    if tw:
+        lines.append(f"Temp files written near this node: {_fmt_kb(tw * BLOCK_KB)}.")
+    return Finding("hash-spill", WARN, f"Hash join split into batches ({kind})",
+                   f"{_where(n)}: " + " ".join(lines), sug, n.id, n.m["excl_ms"])
+
+
 @rule
 def spills(plan: Plan, cfg: Config) -> list[Finding]:
     out = []
@@ -197,12 +254,7 @@ def spills(plan: Plan, cfg: Config) -> list[Finding]:
                 n.id, n.m["excl_ms"]))
         batches = n.get("Hash Batches")
         if batches and batches > 1:
-            out.append(Finding(
-                "hash-spill", WARN, f"Hash join split into {batches} batches",
-                f"{_where(n)} exceeded work_mem (peak {_fmt_kb(n.get('Peak Memory Usage') or 0)}), "
-                "so both sides were written to temp files.",
-                "Raise work_mem / hash_mem_multiplier, or reduce the build side (better row estimate, "
-                "filter earlier, narrower columns).", n.id, n.m["excl_ms"]))
+            out.append(_hash_batches(plan, n, batches))
         du = n.get("Disk Usage")
         if du:
             out.append(Finding(

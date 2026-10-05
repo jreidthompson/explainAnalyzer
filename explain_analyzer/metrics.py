@@ -50,6 +50,33 @@ class Config:
         return cfg
 
 
+_UNITS_KB = {"b": 1 / 1024, "kb": 1, "mb": 1024, "gb": 1024 ** 2, "tb": 1024 ** 3}
+
+
+def parse_size_kb(v) -> float | None:
+    """Parse a GUC memory value ('6GB', '64MB', '4096') into kB; bare numbers are kB."""
+    if v is None:
+        return None
+    m = re.fullmatch(r"\s*([\d.]+)\s*([A-Za-z]*)\s*", str(v))
+    if not m:
+        return None
+    unit = (m.group(2) or "kb").lower()
+    return float(m.group(1)) * _UNITS_KB[unit] if unit in _UNITS_KB else None
+
+
+def _memory_settings(plan: Plan) -> None:
+    """work_mem / hash_mem_multiplier as reported by EXPLAIN (SETTINGS); None if not reported
+    (the option only lists values that differ from the default)."""
+    wm = parse_size_kb(plan.settings.get("work_mem"))
+    try:
+        mult = float(plan.settings["hash_mem_multiplier"]) if "hash_mem_multiplier" in plan.settings else None
+    except (TypeError, ValueError):
+        mult = None
+    plan.m["work_mem_kb"] = wm
+    plan.m["hash_mem_multiplier"] = mult
+    plan.m["hash_mem_kb"] = wm * (mult if mult is not None else 1.0) if wm is not None and mult is not None else None
+
+
 def _f(v, default=0.0) -> float:
     return default if v is None else float(v)
 
@@ -62,6 +89,7 @@ def compute(plan: Plan, cfg: Config) -> None:
     """Fill ``node.m`` for every node and ``plan.m`` with plan-level totals."""
     analyzed = plan.has_analyze
     plan.m["analyzed"] = analyzed
+    _memory_settings(plan)
     _participants(plan.root, 1)
 
     for n in plan.nodes:
