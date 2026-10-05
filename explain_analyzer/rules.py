@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 from typing import Callable
 
-from .context import chain, describe
+from .context import chain, describe, tables
 from .metrics import BLOCK_KB, Config
 from .model import Finding, Node, Plan
 
@@ -48,6 +48,35 @@ def _sev(value: float, warn: float, crit: float, info: float | None = None) -> i
 
 
 # ------------------------------------------------------------------ rules
+
+def origin_nodes(n: Node, cfg: Config) -> list[Node]:
+    """Descendants where a row-estimate error seen at ``n`` actually starts."""
+    out: list[Node] = []
+    for c in n.children:
+        if c.is_subplan_child():
+            continue
+        m = c.m
+        if m["mis"] >= cfg.mis_warn and not m["mis_ignored"] and m["mis_dir"] == n.m["mis_dir"]:
+            if m["mis_origin"]:
+                out.append(c)
+            else:
+                out.extend(origin_nodes(c, cfg))
+    return out
+
+
+def origin_text(n: Node, cfg: Config, limit: int = 3) -> str:
+    srcs = origin_nodes(n, cfg)
+    if not srcs:
+        return ""
+    parts = []
+    for o in srcs[:limit]:
+        tabs = ", ".join(tables(o)[:4]) or "-"
+        cond = o.get("Filter") or o.get("Index Cond") or o.get("Hash Cond") or o.get("Merge Cond") or o.get("Join Filter")
+        parts.append(f"#{o.id} {o.label()} [{tabs}]: expected {_fmt_rows(o.m['est_rows'])}, got "
+                     f"{_fmt_rows(o.m['act_rows'])} ({o.m['mis']:,.0f}x)" + (f"; condition {cond}" if cond else ""))
+    more = f" (+{len(srcs) - limit} more)" if len(srcs) > limit else ""
+    return "; ".join(parts) + more
+
 
 @rule
 def no_analyze(plan: Plan, cfg: Config) -> list[Finding]:
@@ -102,7 +131,9 @@ def row_misestimate(plan: Plan, cfg: Config) -> list[Finding]:
         verb = "under-estimated" if under else "over-estimated"
         if not m["mis_origin"]:
             sev = INFO
-        origin = "originates here" if m["mis_origin"] else "inherited from a child node"
+        src = origin_text(n, cfg)
+        origin = "originates here" if m["mis_origin"] else \
+            ("inherited from " + src if src else "inherited from a child node")
         sug = ""
         if m["mis_origin"]:
             sug = ("Run ANALYZE on the tables involved; if columns are correlated, add extended "
@@ -184,7 +215,7 @@ def rows_removed(plan: Plan, cfg: Config) -> list[Finding]:
     return out
 
 
-def _hash_batches(plan: Plan, n: Node, batches: int) -> Finding:
+def _hash_batches(plan: Plan, n: Node, batches: int, cfg: Config) -> Finding:
     orig = n.get("Original Hash Batches") or batches
     peak = n.get("Peak Memory Usage") or 0
     limit = plan.m.get("hash_mem_kb")
@@ -194,7 +225,8 @@ def _hash_batches(plan: Plan, n: Node, batches: int) -> Finding:
     if limit is not None:
         lim_txt = f"{_fmt_kb(limit)} (work_mem {_fmt_kb(wm)} x hash_mem_multiplier {mult:g})"
     elif wm is not None:
-        lim_txt = f"at least work_mem {_fmt_kb(wm)} (hash_mem_multiplier not reported)"
+        lim_txt = (f"work_mem {_fmt_kb(wm)} x hash_mem_multiplier; the multiplier is not in the plan's Settings, "
+                   "which only lists non-default values, so it was the server default (2.0 on PG 15+, 1.0 before)")
     child = next((c for c in n.children if not c.is_subplan_child()), None)
     est_rows, width = n.m["est_rows"], n.get("Plan Width") or 0
     act_total = n.m["rows_total"]
@@ -214,9 +246,13 @@ def _hash_batches(plan: Plan, n: Node, batches: int) -> Finding:
                      + (f"; actual build rows: {_fmt_rows(act_total)}." if plan.m["analyzed"] else "."))
         sug = ""
         if plan.m["analyzed"] and est_rows > 0 and act_total * 10 < est_rows:
+            src = origin_text(n, cfg) if n.m["mis_dir"] == "over" else ""
             sug = (f"The build side was over-estimated {est_rows / max(act_total, 1):,.0f}x, which is what forced "
-                   "batching. Fix that estimate (ANALYZE, extended statistics, check the join/filter on the child "
-                   "node) and the join will stay in one batch.")
+                   "batching. "
+                   + (f"The error starts at {src}. " if src else
+                      "No single child stands out, so the error is introduced at this node's own estimate "
+                      "(check width and the join/filter feeding it). ")
+                   + "Fix that estimate (ANALYZE, extended statistics) so the join can stay in one batch.")
         elif limit is not None and peak and peak < limit * 0.5:
             sug = (f"Peak memory ({_fmt_kb(peak)}) is far below the limit, so the estimate (not the data) is "
                    "driving this: compare the Hash node's estimated rows/width with the actual, and check the "
@@ -254,7 +290,7 @@ def spills(plan: Plan, cfg: Config) -> list[Finding]:
                 n.id, n.m["excl_ms"]))
         batches = n.get("Hash Batches")
         if batches and batches > 1:
-            out.append(_hash_batches(plan, n, batches))
+            out.append(_hash_batches(plan, n, batches, cfg))
         du = n.get("Disk Usage")
         if du:
             out.append(Finding(

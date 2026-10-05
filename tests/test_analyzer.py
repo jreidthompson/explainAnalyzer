@@ -322,3 +322,27 @@ Hash  (cost=1.00..2.00 rows=100 width=4) (actual time=1.0..2.0 rows=100 loops=1)
 """
         (p, _), = analyze_text(txt)
         self.assertEqual((p.root.get("Hash Batches"), p.root.get("Original Hash Batches")), (64, 8))
+
+
+class OriginTests(unittest.TestCase):
+    def test_inherited_error_names_the_source_node(self):
+        scan = N("Seq Scan", rows=1_000_000, act=1000, total=5.0,
+                 **{"Relation Name": "events", "Alias": "e", "Filter": "(kind = 'x'::text)"})
+        join = N("Hash Join", rows=900_000, act=900, total=6.0, children=[scan],
+                 **{"Hash Cond": "(e.id = u.id)"})
+        top = N("Sort", rows=900_000, act=900, total=7.0, children=[join])
+        p, f = run(top)
+        inh = [x for x in f if x.rule == "row-misestimate" and x.node_id == 1]
+        self.assertEqual(len(inh), 1)
+        self.assertIn("inherited from #3 Seq Scan on events e", inh[0].detail)
+        self.assertIn("kind = 'x'", inh[0].detail)
+
+    def test_hash_finding_points_at_origin(self):
+        scan = N("Seq Scan", rows=5_000_000_000, act=40_000, total=5.0, **{"Relation Name": "big"})
+        h = N("Hash", rows=5_000_000_000, act=40_000, total=6.0, children=[scan],
+              **{"Plan Width": 100, "Peak Memory Usage": 95232, "Hash Batches": 64, "Original Hash Batches": 64})
+        p, f = run(N("Hash Join", rows=10, act=10, total=20.0, children=[N("Seq Scan", rows=10, act=10, **{"Relation Name": "p"}), h]),
+                   Settings={"work_mem": "4GB"})
+        hs = next(x for x in f if x.rule == "hash-spill")
+        self.assertIn("error starts at #4 Seq Scan on big", hs.suggestion)
+        self.assertIn("server default", hs.detail)
