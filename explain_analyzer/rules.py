@@ -4,6 +4,7 @@ from __future__ import annotations
 import re
 from typing import Callable
 
+from .context import chain, describe
 from .metrics import BLOCK_KB, Config
 from .model import Finding, Node, Plan
 
@@ -246,7 +247,8 @@ def nested_loop(plan: Plan, cfg: Config) -> list[Finding]:
                    "which is what made the planner choose a nested loop.")
         out.append(Finding(
             "nested-loop", sev, f"Nested loop runs its inner side {loops:,} times",
-            f"{_where(n)}: inner #{inner.id} {inner.label()} takes {inner_ms:,.1f} ms total ({pct:.0f}% of runtime).{why}",
+            f"{_where(n)}: inner side #{inner.id} ({chain(inner)}) takes {inner_ms:,.1f} ms total "
+            f"({pct:.0f}% of runtime) across {loops:,} executions.{why}",
             "Ensure the inner join column is indexed, fix the outer row estimate (ANALYZE / extended statistics), "
             "or test with SET enable_nestloop = off to see whether a hash/merge join is faster.", n.id, inner_ms))
     return out
@@ -411,5 +413,9 @@ def run_rules(plan: Plan, cfg: Config) -> list[Finding]:
     findings: list[Finding] = []
     for r in RULES:
         findings.extend(r(plan, cfg))
+    by_id = {n.id: n for n in plan.nodes}
+    for f in findings:
+        if f.node_id in by_id and not f.context:
+            f.context = describe(by_id[f.node_id])
     findings.sort(key=lambda f: (-f.severity, -f.impact_ms, f.node_id or 0))
     return findings

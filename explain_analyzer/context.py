@@ -1,0 +1,136 @@
+"""Describe *where* in a query a plan node sits: path from the root, the tables
+beneath it, and for joins the two sides plus the join condition."""
+from __future__ import annotations
+
+import re
+
+from .model import Node
+
+JOINS = ("Nested Loop", "Hash Join", "Merge Join")
+COND_KEYS = ("Hash Cond", "Merge Cond", "Join Filter", "Index Cond", "Recheck Cond", "Filter",
+             "Cache Key")
+_SCANS = ("Scan",)
+
+
+def _real_children(n: Node) -> list[Node]:
+    return [c for c in n.children if not c.is_subplan_child()]
+
+
+def table_name(n: Node) -> str | None:
+    """Short name for a node that reads a relation, else None."""
+    p = n.props
+    rel = p.get("Relation Name")
+    if rel:
+        sch = p.get("Schema")
+        full = f"{sch}.{rel}" if sch else rel
+        alias = p.get("Alias")
+        return f"{full} {alias}" if alias and alias != rel else full
+    if n.node_type == "CTE Scan" and p.get("CTE Name"):
+        return f"CTE {p['CTE Name']}" + (f" {p['Alias']}" if p.get("Alias") and p["Alias"] != p["CTE Name"] else "")
+    if n.node_type == "Function Scan" and p.get("Function Name"):
+        return f"{p['Function Name']}()" + (f" {p['Alias']}" if p.get("Alias") else "")
+    if n.node_type in ("Subquery Scan", "Values Scan") and p.get("Alias"):
+        return p["Alias"]
+    return None
+
+
+def tables(n: Node) -> list[str]:
+    """Distinct tables read in the subtree, in plan order (subplans excluded)."""
+    seen: list[str] = []
+
+    def rec(x: Node) -> None:
+        t = table_name(x)
+        if t and t not in seen:
+            seen.append(t)
+        for c in _real_children(x):
+            rec(c)
+    rec(n)
+    return seen
+
+
+def _aliases(n: Node) -> set[str]:
+    out = set()
+    for x in n.walk():
+        for k in ("Alias", "Relation Name", "CTE Name"):
+            if x.props.get(k):
+                out.add(x.props[k])
+    return out
+
+
+def side(n: Node) -> tuple[Node | None, Node | None]:
+    ch = _real_children(n)
+    if n.node_type in JOINS and len(ch) >= 2:
+        return ch[0], ch[1]
+    return None, None
+
+
+def chain(n: Node) -> str:
+    """Describe a side as e.g. 'Memoize > Index Scan using i on t x' (through single-child wrappers)."""
+    parts = []
+    x = n
+    while True:
+        parts.append(x.label())
+        ch = _real_children(x)
+        if len(ch) == 1 and x.node_type in ("Memoize", "Materialize", "Hash", "Sort", "Incremental Sort",
+                                              "Gather", "Gather Merge", "Result", "Unique", "Limit"):
+            x = ch[0]
+            continue
+        break
+    return " > ".join(parts)
+
+
+def join_conditions(n: Node) -> list[str]:
+    """Join condition(s): the join node's own conds, plus conditions in the inner
+    subtree that reference tables from the outer side (parameterised nested loops)."""
+    conds: list[str] = []
+
+    def add(v) -> None:
+        for s in (v if isinstance(v, list) else [v]):
+            if isinstance(s, str) and s not in conds:
+                conds.append(s if len(s) <= 240 else s[:237] + "...")
+
+    for k in ("Hash Cond", "Merge Cond", "Join Filter"):
+        if n.props.get(k):
+            add(n.props[k])
+    outer, inner = side(n)
+    if outer is not None and inner is not None:
+        names = {a for a in _aliases(outer) if a}
+        if names:
+            pat = re.compile(r"(?<![\w.])(?:" + "|".join(re.escape(a) for a in sorted(names, key=len, reverse=True)) + r")\.")
+            for x in inner.walk():
+                for k in ("Index Cond", "Recheck Cond", "Filter", "Cache Key"):
+                    v = x.props.get(k)
+                    vals = v if isinstance(v, list) else [v]
+                    if any(isinstance(s, str) and pat.search(s) for s in vals):
+                        add(v)
+    return conds
+
+
+def path(n: Node, keep: int = 5) -> str:
+    chain_ = list(reversed(list(n.ancestors()))) + [n]
+    shown = chain_[-keep:]
+    parts = [f"#{x.id} {x.node_type if x is not n else x.label()}" for x in shown]
+    if len(chain_) > keep:
+        parts.insert(0, "...")
+    return " > ".join(parts)
+
+
+def describe(n: Node, limit: int = 8) -> list[str]:
+    """Human-readable context lines for a node."""
+    lines = [f"Location: {path(n)}"]
+    outer, inner = side(n)
+    if outer is not None:
+        jt = n.props.get("Join Type") or "Inner"
+        lines.append(f"Join ({jt}): outer #{outer.id} [{', '.join(tables(outer)[:limit]) or '?'}]"
+                     f"  with  inner #{inner.id} [{', '.join(tables(inner)[:limit]) or '?'}]")
+        lines.append(f"Inner side: {chain(inner)}")
+        for c in join_conditions(n):
+            lines.append(f"On: {c}")
+    else:
+        t = tables(n)
+        if t:
+            more = f" (+{len(t) - limit} more)" if len(t) > limit else ""
+            lines.append(("Table: " if len(t) == 1 and table_name(n) else "Tables: ") + ", ".join(t[:limit]) + more)
+        if n.node_type == "Memoize" and n.props.get("Cache Key"):
+            lines.append(f"Cache key: {n.props['Cache Key']}")
+    return lines

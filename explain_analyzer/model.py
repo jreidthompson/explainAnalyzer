@@ -94,6 +94,7 @@ class Finding:
     suggestion: str = ""
     node_id: int | None = None
     impact_ms: float = 0.0
+    context: list[str] = field(default_factory=list)  # where in the query this applies
 
     @property
     def severity_name(self) -> str:

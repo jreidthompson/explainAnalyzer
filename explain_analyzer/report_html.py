@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from .context import describe
 from .model import Finding, Node, Plan, SEVERITY_NAMES
 from .report_text import summary_lines
 
@@ -37,6 +38,7 @@ def build_data(plan: Plan, findings: list[Finding]) -> dict[str, Any]:
             "cost_pct": round(m["cost_pct"], 1),
             "read": m["buf_excl"].get("Shared Read Blocks", 0),
             "hit": m["buf_excl"].get("Shared Hit Blocks", 0),
+            "ctx": describe(n),
             "props": _scalar_props(n),
         })
     return {
@@ -44,7 +46,7 @@ def build_data(plan: Plan, findings: list[Finding]) -> dict[str, Any]:
         "summary": summary_lines(plan),
         "nodes": nodes,
         "findings": [{"rule": f.rule, "sev": f.severity, "sevName": SEVERITY_NAMES[f.severity],
-                      "title": f.title, "detail": f.detail, "suggestion": f.suggestion,
+                      "title": f.title, "detail": f.detail, "suggestion": f.suggestion, "ctx": f.context,
                       "node": f.node_id, "impact": round(f.impact_ms, 3)} for f in findings],
     }
 
@@ -69,7 +71,7 @@ h1{font-size:20px;margin:0 0 8px}h2{font-size:16px;margin:24px 0 8px}
 .sum div{font-family:ui-monospace,monospace;font-size:13px}
 .f{border-left:4px solid var(--i);margin:6px 0;cursor:pointer}.f.s3{border-color:var(--c)}.f.s2{border-color:var(--w)}
 .f b.s3{color:var(--c)}.f b.s2{color:var(--w)}.f b.s1{color:var(--i)}
-.f .d{color:var(--mut);margin-top:2px}.f .sg{margin-top:2px}
+.f .d{color:var(--mut);margin-top:2px}.ctx{margin-top:4px;padding-left:8px;border-left:2px solid var(--bd);font-family:ui-monospace,monospace;font-size:12px;color:var(--mut);overflow-wrap:anywhere}.f .sg{margin-top:2px}
 table{border-collapse:collapse;width:100%;font-size:13px}th,td{border-bottom:1px solid var(--bd);padding:4px 6px;text-align:right;white-space:nowrap}
 th{cursor:pointer;position:sticky;top:0;background:var(--card);user-select:none}
 td.l,th.l{text-align:left;white-space:normal}tr.sel td{background:var(--hl)}tr.never td{color:var(--mut)}
@@ -107,7 +109,7 @@ function select(id){
   const n=byId.get(id);const p=$('props');
   p.textContent='';
   if(!n)return;
-  let s='#'+n.id+' '+n.label+'\n';
+  let s='#'+n.id+' '+n.label+'\n'+n.ctx.map(x=>'  '+x).join('\n')+'\n\n';
   for(const [k,v] of Object.entries(n.props))s+='  '+k+': '+v+'\n';
   for(const f of D.findings)if(f.node===id)s+='\n['+f.sevName+'] '+f.title+'\n  '+f.detail+'\n  -> '+f.suggestion+'\n';
   p.textContent=s;
@@ -121,6 +123,7 @@ D.findings.forEach(f=>{
   h.appendChild(document.createTextNode(f.title+(f.node?'  (node #'+f.node+')':'')));
   d.appendChild(h);
   if(f.detail)d.appendChild(el('div','d',f.detail));
+  if(f.ctx&&f.ctx.length){const c=el('div','ctx');f.ctx.forEach(x=>c.appendChild(el('div',null,x)));d.appendChild(c)}
   if(f.suggestion)d.appendChild(el('div','sg','\u2192 '+f.suggestion));
   if(f.node!=null)d.onclick=()=>select(f.node);
   $('finds').appendChild(d);

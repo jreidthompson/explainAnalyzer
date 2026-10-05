@@ -58,6 +58,8 @@ def render(plan: Plan, findings: list[Finding], color: bool = False, top: int = 
         L.append(f"{i:>2}. {tag} {f.title}{loc}")
         if f.detail:
             L.append(f"      {f.detail}")
+        for c in f.context:
+            L.append(_c(f"      | {c}", "2", color))
         if f.suggestion:
             L.append(f"      -> {f.suggestion}")
 

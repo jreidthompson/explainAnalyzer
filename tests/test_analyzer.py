@@ -260,3 +260,33 @@ class OfflineGuarantee(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ContextTests(unittest.TestCase):
+    def _plan(self):
+        outer = N("Seq Scan", rows=10, act=3_600_000, total=900.0,
+                  **{"Relation Name": "orders", "Alias": "o", "Parent Relationship": "Outer"})
+        scan = N("Index Scan", rows=1, act=1, total=0.01, loops=3_600_000,
+                 **{"Relation Name": "customers", "Alias": "c", "Index Name": "customers_pkey",
+                    "Index Cond": "(c.id = o.customer_id)", "Parent Relationship": "Outer"})
+        memo = N("Memoize", rows=1, act=1, loops=3_600_000, total=0.05, children=[scan],
+                 **{"Cache Key": "o.customer_id", "Parent Relationship": "Inner"})
+        nl = N("Nested Loop", rows=10, act=3_600_000, total=300000.0, children=[outer, memo],
+               **{"Join Type": "Left"})
+        return run(N("Limit", rows=10, act=10, children=[nl]), **{"Execution Time": 1_000_000.0})
+
+    def test_nested_loop_finding_names_tables_and_condition(self):
+        p, f = self._plan()
+        nl = next(x for x in f if x.rule == "nested-loop")
+        ctx = "\n".join(nl.context)
+        self.assertIn("orders o", ctx)
+        self.assertIn("customers c", ctx)
+        self.assertIn("(c.id = o.customer_id)", ctx)
+        self.assertIn("Location: #1 Limit > #2 Nested Loop Left Join", ctx)
+        self.assertIn("Memoize > Index Scan using customers_pkey on customers c", nl.detail)
+
+    def test_context_in_reports(self):
+        p, f = self._plan()
+        self.assertIn("| On: (c.id = o.customer_id)", report_text.render(p, f))
+        self.assertIn("(c.id = o.customer_id)", report_html.render(p, f))
+        self.assertIn("(c.id = o.customer_id)", json.dumps(report_html.build_data(p, f)))

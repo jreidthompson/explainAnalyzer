@@ -34,6 +34,7 @@ def _json_doc(plan: Plan, findings: list[Finding]) -> dict:
         "analyzed": plan.m["analyzed"],
         "findings": [{"rule": f.rule, "severity": f.severity_name, "title": f.title,
                       "detail": f.detail, "suggestion": f.suggestion, "node": f.node_id,
+                      "context": f.context,
                       "impact_ms": round(f.impact_ms, 3)} for f in findings],
         "nodes": [{"id": n.id, "parent": n.parent.id if n.parent else None, "label": n.label(),
                    "exclusive_ms": round(n.m["excl_ms"], 3), "exclusive_pct": round(n.m["excl_pct"], 1),
