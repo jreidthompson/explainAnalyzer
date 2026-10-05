@@ -1,0 +1,11 @@
+Nested Loop  (cost=0.28..4197.27 rows=17 width=5) (actual time=0.013..7.231 rows=2000 loops=1)
+  Buffers: local hit=6000 read=1088
+  ->  Seq Scan on t  (cost=0.00..4088.00 rows=17 width=4) (actual time=0.009..6.134 rows=2000 loops=1)
+        Filter: ((a = 1) AND (b = 1))
+        Rows Removed by Filter: 198000
+        Buffers: local read=1088
+  ->  Index Scan using d_id_idx on d  (cost=0.28..6.42 rows=1 width=9) (actual time=0.000..0.000 rows=1 loops=2000)
+        Index Cond: (id = t.k)
+        Buffers: local hit=6000
+Planning Time: 0.046 ms
+Execution Time: 7.281 ms

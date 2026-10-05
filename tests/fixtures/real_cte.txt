@@ -1,0 +1,20 @@
+Aggregate  (cost=3729.53..3729.54 rows=1 width=8) (actual time=6.745..6.747 rows=1 loops=1)
+  Buffers: local hit=27 read=1093
+  CTE x
+    ->  Seq Scan on t  (cost=0.00..3588.00 rows=1820 width=16) (actual time=0.007..6.119 rows=2000 loops=1)
+          Filter: (a = 1)
+          Rows Removed by Filter: 198000
+          Buffers: local read=1088
+  InitPlan 2
+    ->  Aggregate  (cost=94.50..94.51 rows=1 width=32) (actual time=0.352..0.352 rows=1 loops=1)
+          Buffers: local hit=27 read=5
+          ->  Seq Scan on d  (cost=0.00..82.00 rows=5000 width=4) (actual time=0.002..0.185 rows=5000 loops=1)
+                Buffers: local hit=27 read=5
+  ->  CTE Scan on x  (cost=0.00..45.50 rows=607 width=0) (actual time=0.446..6.708 rows=1000 loops=1)
+        Filter: ((k)::numeric > (InitPlan 2).col1)
+        Rows Removed by Filter: 1000
+        Buffers: local hit=27 read=1093
+Planning:
+  Buffers: shared hit=14 read=1
+Planning Time: 0.217 ms
+Execution Time: 6.793 ms

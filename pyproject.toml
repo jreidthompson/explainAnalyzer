@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "explain-analyzer"
+version = "0.1.0"
+description = "Offline analyzer for PostgreSQL EXPLAIN plans"
+requires-python = ">=3.12"
+dependencies = []
+
+[project.scripts]
+explain-analyzer = "explain_analyzer.cli:main"
+
+[tool.setuptools]
+packages = ["explain_analyzer"]
