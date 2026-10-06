@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from .context import describe
+from .context import describe, join_on, join_sides
 from .model import Finding, Node, Plan, SEVERITY_NAMES
 from .report_text import summary_lines
 
@@ -38,7 +38,7 @@ def build_data(plan: Plan, findings: list[Finding]) -> dict[str, Any]:
             "cost_pct": round(m["cost_pct"], 1),
             "read": m["buf_excl"].get("Shared Read Blocks", 0),
             "hit": m["buf_excl"].get("Shared Hit Blocks", 0),
-            "ctx": describe(n),
+            "ctx": describe(n), "on": join_on(n, 400), "sides": join_sides(n, 300),
             "props": _scalar_props(n),
         })
     return {
@@ -79,7 +79,7 @@ td.l,th.l{text-align:left;white-space:normal}tr.sel td{background:var(--hl)}tr.n
 .tree{font-family:ui-monospace,monospace;font-size:13px}.tree div.n{padding:1px 4px;border-radius:4px;cursor:pointer;white-space:nowrap}
 .tree div.n:hover{background:var(--card)}.tree .sel{background:var(--hl)}
 .t{display:inline-block;width:14px;color:var(--mut)}.mut{color:var(--mut)}
-.tag3{color:var(--c)}.tag2{color:var(--w)}.tag1{color:var(--i)}
+.on{color:var(--i)}.tag3{color:var(--c)}.tag2{color:var(--w)}.tag1{color:var(--i)}
 #props{white-space:pre-wrap;font-family:ui-monospace,monospace;font-size:12px;overflow-wrap:anywhere}
 .wrap{overflow-x:auto}
 </style></head><body>
@@ -141,6 +141,7 @@ function drawTree(n,depth,parent){
   else if(D.analyzed)st=fmt(n.excl_ms,2)+' ms ('+fmt(n.excl_pct)+'%)  rows '+fmt(n.est)+'\u2192'+fmt(n.act)+(n.mis>=10&&!n.mis_ignored?' \u00d7'+fmt(n.mis)+' '+n.mis_dir:'')+'  loops '+fmt(n.loops);
   else st='rows '+fmt(n.est)+'  cost '+fmt(n.cost_pct)+'%';
   row.appendChild(el('span','mut',st));
+  if(n.on){const o=el('span','on','   on '+n.on);row.appendChild(o)}
   row.onclick=e=>{if(e.target===tog&&k.length){const box=row.nextSibling;const hide=box.style.display!=='none';box.style.display=hide?'none':'';tog.textContent=hide?'\u25B8':'\u25BE'}else select(n.id)};
   parent.appendChild(row);
   const box=el('div');parent.appendChild(box);
@@ -148,7 +149,7 @@ function drawTree(n,depth,parent){
   k.forEach(c=>{if(c.sub){const s=el('div','mut',c.sub);s.style.paddingLeft=((depth+1)*18+14)+'px';box.appendChild(s)}drawTree(c,depth+1,box)});
 }
 drawTree(D.nodes[0],0,$('tree'));
-const cols=[['id','#',0],['label','Node',1],['excl_ms','Excl ms',0],['excl_pct','Excl %',0],['incl_ms','Incl ms',0],['loops','Loops',0],['est','Est rows',0],['act','Act rows',0],['mis','Misest \u00d7',0],['read','Shared read',0],['hit','Shared hit',0]];
+const cols=[['id','#',0],['label','Node',1],['excl_ms','Excl ms',0],['excl_pct','Excl %',0],['incl_ms','Incl ms',0],['loops','Loops',0],['est','Est rows',0],['act','Act rows',0],['mis','Misest \u00d7',0],['read','Shared read',0],['hit','Shared hit',0],['on','Join / lookup on',1],['sides','Tables joined',1]];
 let sortKey='excl_ms',sortDir=-1;
 function drawTable(){
   const t=$('tbl');t.textContent='';
@@ -162,6 +163,7 @@ function drawTable(){
       const td=el('td',left?'l':'');
       if(k==='excl_pct'){const b=el('span','bar');b.style.width=Math.min(60,n.excl_pct*0.6)+'px';td.appendChild(b);td.appendChild(document.createTextNode(fmt(n.excl_pct,1)))}
       else if(k==='mis')td.textContent=n.mis>1&&!n.mis_ignored?fmt(n.mis)+' '+(n.mis_dir||''):'';
+      else if(k==='on'||k==='sides')td.textContent=n[k]||'';
       else td.textContent=(k==='label'||k==='id')?(k==='id'?n.id:n.label):fmt(n[k],k==='excl_ms'||k==='incl_ms'?2:0);
       tr.appendChild(td)});
     t.appendChild(tr)});

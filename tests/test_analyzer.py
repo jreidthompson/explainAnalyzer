@@ -346,3 +346,48 @@ class OriginTests(unittest.TestCase):
         hs = next(x for x in f if x.rule == "hash-spill")
         self.assertIn("error starts at #4 Seq Scan on big", hs.suggestion)
         self.assertIn("server default", hs.detail)
+
+
+class JoinKeyDisplayTests(unittest.TestCase):
+    def _plan(self):
+        o = N("Seq Scan", rows=10, act=10, **{"Relation Name": "orders", "Alias": "o", "Parent Relationship": "Outer"})
+        c = N("Index Scan", rows=1, act=1, loops=10, **{"Relation Name": "customers", "Alias": "c",
+              "Index Name": "customers_pkey", "Index Cond": "(c.id = o.customer_id)", "Parent Relationship": "Inner"})
+        nl = N("Nested Loop", rows=10, act=10, total=5000.0, children=[o, c])
+        hj = N("Hash Join", rows=10, act=10, total=6000.0, **{"Hash Cond": "(o.id = i.order_id)"},
+               children=[nl, N("Hash", rows=5, act=5, total=1.0, **{"Parent Relationship": "Inner"},
+                               children=[N("Seq Scan", rows=5, act=5, **{"Relation Name": "items", "Alias": "i"})])])
+        return run(hj, **{"Execution Time": 6000.0})
+
+    def test_text_tree_shows_join_keys(self):
+        p, f = self._plan()
+        out = report_text.render(p, f)
+        self.assertIn("on: (o.id = i.order_id)", out)
+        self.assertIn("on: (c.id = o.customer_id)", out)
+        self.assertIn("tables: orders o, customers c  <->  items i", out)
+
+    def test_findings_headline_includes_join_key(self):
+        p, f = self._plan()
+        hot = next(x for x in f if x.rule == "hot-node" and x.node_id == 1)
+        self.assertIn("Hash Join on (o.id = i.order_id)", hot.detail)
+
+    def test_html_tree_and_table_have_join_columns(self):
+        p, f = self._plan()
+        data = report_html.build_data(p, f)
+        self.assertEqual(data["nodes"][0]["on"], "(o.id = i.order_id)")
+        html = report_html.render(p, f)
+        self.assertIn("Join / lookup on", html)
+
+
+class QualifyTests(unittest.TestCase):
+    def test_bare_index_cond_columns_get_the_scan_alias(self):
+        from explain_analyzer.context import qualify
+        from explain_analyzer.model import Node
+        n = Node({"Node Type": "Index Scan", "Alias": "d", "Relation Name": "d"})
+        self.assertEqual(qualify(n, "(id = t.k)"), "(d.id = t.k)")
+        self.assertEqual(qualify(n, "((a = 1) AND (b >= t.x))"), "((d.a = 1) AND (d.b >= t.x))")
+        self.assertEqual(qualify(n, "(d.id = t.k)"), "(d.id = t.k)")  # already qualified
+
+    def test_join_line_uses_qualified_inner_cond(self):
+        (p, f), = analyze_text((FIX / "real_nl.json").read_text())
+        self.assertIn("on: (d.id = t.k)", report_text.render(p, f))

@@ -79,6 +79,19 @@ def chain(n: Node) -> str:
     return " > ".join(parts)
 
 
+_BARE = re.compile(r"(?<=\()(?P<col>[A-Za-z_]\w*)(?=\s*(?:=|<>|<=|>=|<|>|~~\*?|!~~\*?|@>|<@|&&)\s)")
+
+
+def qualify(node: Node, cond):
+    """Without VERBOSE, columns of the scanned table are unqualified in its own
+    Index Cond/Recheck Cond/Filter ('(id = t.k)'). Prefix them with the node's alias."""
+    alias = node.props.get("Alias") or node.props.get("Relation Name")
+    if not alias:
+        return cond
+    f = lambda s: _BARE.sub(lambda m: f"{alias}.{m.group('col')}", s) if isinstance(s, str) else s
+    return [f(s) for s in cond] if isinstance(cond, list) else f(cond)
+
+
 def join_conditions(n: Node) -> list[str]:
     """Join condition(s): the join node's own conds, plus conditions in the inner
     subtree that reference tables from the outer side (parameterised nested loops)."""
@@ -102,7 +115,7 @@ def join_conditions(n: Node) -> list[str]:
                     v = x.props.get(k)
                     vals = v if isinstance(v, list) else [v]
                     if any(isinstance(s, str) and pat.search(s) for s in vals):
-                        add(v)
+                        add(qualify(x, v))
     return conds
 
 
@@ -134,3 +147,32 @@ def describe(n: Node, limit: int = 8) -> list[str]:
         if n.node_type == "Memoize" and n.props.get("Cache Key"):
             lines.append(f"Cache key: {n.props['Cache Key']}")
     return lines
+
+
+def _clip(s: str, n: int) -> str:
+    return s if len(s) <= n else s[: n - 3] + "..."
+
+
+def join_on(n: Node, maxlen: int = 140) -> str:
+    """Join condition for a join node (table.column = table.column), or the index
+    lookup condition for an index scan. Empty string for other nodes."""
+    if n.node_type in JOINS:
+        conds = join_conditions(n)
+        return _clip(" AND ".join(conds), maxlen) if conds else ""
+    if n.node_type in ("Index Scan", "Index Only Scan", "Bitmap Index Scan"):
+        v = qualify(n, n.props.get("Index Cond"))
+        if v:
+            return _clip(" AND ".join(v) if isinstance(v, list) else v, maxlen)
+    return ""
+
+
+def join_sides(n: Node, maxlen: int = 110) -> str:
+    """'outer tables <-> inner tables' for a join node, else ''."""
+    outer, inner = side(n)
+    if outer is None:
+        return ""
+    a, b = ", ".join(tables(outer)[:3]) or "?", ", ".join(tables(inner)[:3]) or "?"
+    ta, tb = len(tables(outer)), len(tables(inner))
+    a += f" (+{ta - 3})" if ta > 3 else ""
+    b += f" (+{tb - 3})" if tb > 3 else ""
+    return _clip(f"{a}  <->  {b}", maxlen)

@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 from typing import Callable
 
-from .context import chain, describe, tables
+from .context import chain, describe, join_on, tables
 from .metrics import BLOCK_KB, Config
 from .model import Finding, Node, Plan
 
@@ -20,7 +20,8 @@ def rule(fn: Rule) -> Rule:
 
 
 def _where(n: Node) -> str:
-    return f"#{n.id} {n.label()}"
+    on = join_on(n, 90)
+    return f"#{n.id} {n.label()}" + (f" on {on}" if on else "")
 
 
 def _cols(expr: str | None) -> str:
