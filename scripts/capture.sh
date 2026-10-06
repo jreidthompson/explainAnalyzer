@@ -6,6 +6,6 @@ set -euo pipefail
 q=$(cat)
 psql -X -q -At "$@" <<SQL
 BEGIN;
-EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS, FORMAT JSON) ${q%;};
+EXPLAIN (ANALYZE, BUFFERS, SETTINGS, FORMAT JSON) ${q%;};
 ROLLBACK;
 SQL

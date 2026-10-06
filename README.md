@@ -5,21 +5,32 @@ access, no telemetry - safe for plans that reference proprietary schema or data.
 useful parts of explain.depesz.com, Dalibo PEV2, pgMustard and explain.tensor.ru: per-node
 *exclusive* time, row-estimate error, buffer analysis and ranked, explained findings.
 
-## Capture a plan
+## Fastest path: from slow query to a tested fix
 ```
-scripts/capture.sh -d mydb < query.sql > plan.json     # EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS, FORMAT JSON), rolled back
+psql -X -At -d DB -c "EXPLAIN (ANALYZE, BUFFERS, SETTINGS, FORMAT JSON) <your query>" > plan.json
+python -m explain_analyzer plan.json --html report.html      # findings + ranked Action plan with copy-paste SQL
+python -m explain_analyzer plan.json --script exp --query query.sql
+(cd exp && psql -X -d DB -f experiments.sql)                  # tries every action inside BEGIN..ROLLBACK
+python -m explain_analyzer --compare exp                      # which one helped, and the SQL to apply it
 ```
-`ANALYZE` **executes** the statement. Text plans (psql / pgAdmin / auto_explain) also work; JSON is the
-most reliable. Always include `BUFFERS`. Several plans in one file are all analysed.
+The **Action plan** turns each finding into staged, ready-to-run SQL (ANALYZE, `CREATE INDEX` with the right column
+order, `CREATE STATISTICS`, `SET LOCAL work_mem` sized from the observed spill, `VACUUM`, rewrite templates), each with
+a rollback-safe "try" version, a production "apply" version, cautions and what to check afterwards.
+`--script` runs all of them for you; `--compare` ranks the results and prints the smallest change that captures
+nearly all of the gain. Details and the reasoning behind each action: [docs/optimization-guide.md](docs/optimization-guide.md).
+
+`ANALYZE` **executes** the statement (DML is rolled back by the generated script). Run experiments on staging or a
+replica copy: a plain `CREATE INDEX` blocks writes to its table while building.
 
 ## Use
 ```
-python -m explain_analyzer plan.json                 # ranked findings + annotated tree
+python -m explain_analyzer plan.json                 # ranked findings + Action plan + annotated tree
 python -m explain_analyzer plan.txt --html out.html  # self-contained report (no external assets)
-cat plan.json | python -m explain_analyzer --json    # machine-readable
+cat plan.json | python -m explain_analyzer --json    # machine-readable (findings, actions, nodes)
 python -m explain_analyzer plan.json --fail-on critical   # exit 2 for CI gates
 python -m explain_analyzer plan.json --sanitize names     # redact constants + hash identifiers before sharing
 python -m explain_analyzer plan.json --set mis_warn=5 --set hot_warn_pct=15   # tune thresholds (see metrics.Config)
+python -m explain_analyzer --compare before.json after.json   # did a change help? node-by-node deltas
 ```
 Install as a command with `pip install .` (`explain-analyzer`). Run tests: `python -m unittest discover -s tests -t .`
 
@@ -36,6 +47,7 @@ checks only.
 * Exclusive time = node time x loops, divided by participants below Gather, minus child time. InitPlan/CTE
   time is deducted from the node that consumes it. It is an approximation, as in the web tools.
 * `--sanitize` is best effort (regex based); review output before sharing outside your organisation.
+* Index/statistics names and column lists are derived from the plan's conditions; always read the SQL before running it.
 * The PEV2 graph view: download `pev2.html` from github.com/dalibo/pev2/releases once and open it locally
   (it runs fully offline). It is not bundled or automated here.
 * Tests assert that no network modules are imported and that generated HTML references no external URLs.

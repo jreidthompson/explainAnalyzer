@@ -36,7 +36,7 @@ def summary_lines(plan: Plan) -> list[str]:
 
 
 def render(plan: Plan, findings: list[Finding], color: bool = False, top: int = 0,
-           min_severity: int = 1) -> str:
+           min_severity: int = 1, actions: bool = True) -> str:
     L: list[str] = []
     L.append(_c("== Summary ==", "1", color))
     L.extend(summary_lines(plan))
@@ -63,10 +63,15 @@ def render(plan: Plan, findings: list[Finding], color: bool = False, top: int = 
             L.append(_c(f"      | {c}", "2", color))
         if f.suggestion:
             L.append(f"      -> {f.suggestion}")
+        if f.actions:
+            L.append(f"      fix: see action {', '.join(f.actions)} below")
 
     L.append("")
     L.append(_c("== Plan (excl = own time, rows = estimated -> actual per loop) ==", "1", color))
     _tree(plan.root, L, "", True, plan, by_node, color)
+    if actions and plan.m.get("actions") is not None:
+        L.append("")
+        L.append(render_actions(plan.m["actions"], color))
     return "\n".join(L)
 
 
@@ -106,3 +111,44 @@ def _tree(n: Node, out: list[str], prefix: str, last: bool, plan: Plan,
         if crel:
             out.append(f"{child_prefix}   ({crel})")
         _tree(c, out, child_prefix, i == len(n.children) - 1, plan, by_node, color, False)
+
+
+def render_actions(actions, color: bool = False, with_sql: bool = True) -> str:
+    from .remedies import STAGES
+    L = [_c("== Action plan (work top to bottom; re-capture the plan after each stage) ==", "1", color)]
+    if not actions:
+        L.append("Nothing actionable was derived from the findings.")
+        return "\n".join(L)
+    L.append("Why this order: refresh statistics first (cheap, and it can make later findings vanish), then structural "
+             "fixes, then settings. Each change can alter the plan, so findings below a change may no longer apply.")
+    stage = None
+    for a in actions:
+        if a.stage != stage:
+            stage = a.stage
+            L += ["", _c(f"-- Stage {stage}: {STAGES[stage]}", "1;36", color)]
+        flags = [a.kind, f"confidence {a.confidence}"]
+        if a.impact_ms:
+            flags.append(f"~{a.impact_ms:,.0f} ms at stake")
+        if a.diagnostic_only:
+            flags.append("DIAGNOSTIC ONLY")
+        if a.manual:
+            flags.append("manual change")
+        L.append(f"{_c(a.id, '1', color)}  {a.title}   [{', '.join(flags)}]")
+        L.append(f"      why: {a.why}")
+        if with_sql:
+            for label, stmts in a.try_variants:
+                head = "try (safe: run inside BEGIN ... ROLLBACK)" if a.transactional else "try (NOT rolled back - routine maintenance)"
+                L.append(f"      {head}: {label}")
+                L += [f"          {s}" for s in stmts]
+            if a.apply:
+                L.append("      apply:")
+                L += [f"          {s}" for s in a.apply]
+            if a.investigate_sql:
+                L.append("      run / read:")
+                for q in a.investigate_sql:
+                    L += [f"          {line}" for line in q.split("\n")]
+        for c in a.caveats:
+            L.append(f"      caution: {c}")
+        if a.verify:
+            L.append(f"      verify: {a.verify}")
+    return "\n".join(L)

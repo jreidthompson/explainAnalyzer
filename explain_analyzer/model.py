@@ -95,6 +95,7 @@ class Finding:
     node_id: int | None = None
     impact_ms: float = 0.0
     context: list[str] = field(default_factory=list)  # where in the query this applies
+    actions: list[str] = field(default_factory=list)  # ids of remedies (A1, A2...) that address it
 
     @property
     def severity_name(self) -> str:

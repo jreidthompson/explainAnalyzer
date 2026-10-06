@@ -10,6 +10,7 @@ from . import __version__
 from .metrics import Config, compute
 from .model import SEVERITY_VALUES, Plan, Finding
 from .parser import ParseError, parse_input
+from .remedies import build_actions
 from .rules import run_rules
 from .sanitize import Sanitizer
 
@@ -23,7 +24,9 @@ def analyze_text(text: str, cfg: Config | None = None, sanitize: str | None = No
         compute(plan, cfg)
         if sanitize:
             Sanitizer(names=sanitize == "names", salt=salt).plan(plan)
-        out.append((plan, run_rules(plan, cfg)))
+        findings = run_rules(plan, cfg)
+        plan.m["actions"] = build_actions(plan, findings, cfg)
+        out.append((plan, findings))
     return out
 
 
@@ -34,8 +37,14 @@ def _json_doc(plan: Plan, findings: list[Finding]) -> dict:
         "analyzed": plan.m["analyzed"],
         "findings": [{"rule": f.rule, "severity": f.severity_name, "title": f.title,
                       "detail": f.detail, "suggestion": f.suggestion, "node": f.node_id,
-                      "context": f.context,
+                      "context": f.context, "actions": f.actions,
                       "impact_ms": round(f.impact_ms, 3)} for f in findings],
+        "actions": [{"id": a.id, "kind": a.kind, "stage": a.stage, "title": a.title, "why": a.why,
+                     "confidence": a.confidence, "impact_ms": round(a.impact_ms, 1),
+                     "try": [{"label": l, "sql": s} for l, s in a.try_variants], "apply": a.apply,
+                     "investigate_sql": a.investigate_sql, "caveats": a.caveats, "verify": a.verify,
+                     "diagnostic_only": a.diagnostic_only, "manual": a.manual, "nodes": a.nodes}
+                    for a in plan.m.get("actions", [])],
         "nodes": [{"id": n.id, "parent": n.parent.id if n.parent else None, "label": n.label(),
                    "exclusive_ms": round(n.m["excl_ms"], 3), "exclusive_pct": round(n.m["excl_pct"], 1),
                    "loops": n.m["loops"], "est_rows": n.m["est_rows"], "actual_rows": n.m["act_rows"],
@@ -60,8 +69,31 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--salt", default="", help="salt for hashed identifiers with --sanitize names")
     ap.add_argument("--set", action="append", default=[], metavar="NAME=VALUE",
                     help="override a rule threshold (see explain_analyzer/metrics.py Config)")
+    ap.add_argument("--no-actions", action="store_true", help="omit the action plan from the text report")
+    ap.add_argument("--script", metavar="DIR",
+                    help="write DIR/experiments.sql: a psql script that tests every action inside "
+                         "BEGIN...ROLLBACK and captures the resulting plans")
+    ap.add_argument("--query", metavar="FILE", help="the SQL statement the plan came from (copied into --script DIR)")
+    ap.add_argument("--compare", nargs="+", metavar="PATH",
+                    help="compare plans: a --script DIR, or BASELINE.json CANDIDATE.json [...]")
     ap.add_argument("--version", action="version", version=__version__)
     args = ap.parse_args(argv)
+
+    if args.compare:
+        from .compare import compare_dir, compare_files
+        try:
+            cfg = Config.from_overrides(args.set)
+            paths = [Path(p) for p in args.compare]
+            text, rows = compare_dir(paths[0], cfg) if len(paths) == 1 and paths[0].is_dir() \
+                else compare_files(paths, cfg)
+        except (ValueError, OSError, KeyError) as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+        if args.json:
+            print(json.dumps([{k: v for k, v in r.items() if k != "deltas"} for r in rows], indent=2, default=str))
+        else:
+            print(text)
+        return 0
 
     try:
         cfg = Config.from_overrides(args.set)
@@ -89,7 +121,14 @@ def main(argv: list[str] | None = None) -> int:
         else:
             if len(results) > 1:
                 print(f"######## Plan {i + 1} of {len(results)} ########")
-            print(report_text.render(plan, findings, color, args.top, minsev))
+            print(report_text.render(plan, findings, color, args.top, minsev, not args.no_actions))
+        if args.script:
+            from .experiments import generate
+            d = Path(args.script) if len(results) == 1 else Path(args.script) / f"plan{i + 1}"
+            man = generate(plan.m.get("actions", []), d, args.query, args.file)
+            print(f"\nwrote {d}/experiments.sql ({len(man['experiments'])} experiments). Next:\n"
+                  f"  cd {d} && psql -X -d <database> -f experiments.sql\n"
+                  f"  python -m explain_analyzer --compare {d}", file=sys.stderr)
     if args.json:
         print(json.dumps(docs if len(docs) > 1 else docs[0], indent=2))
     if args.fail_on and worst >= SEVERITY_VALUES[args.fail_on]:

@@ -417,3 +417,170 @@ class KeysDisplayTests(unittest.TestCase):
         self.assertIn("'Keys'", html)
         self.assertNotIn("max-width:1300px", html)
         self.assertNotIn("row.nextSibling", html)
+
+
+def actions_for(plan_dict, **extra):
+    doc = [{"Plan": plan_dict, **extra}]
+    (plan, findings), = analyze_text(json.dumps(doc))
+    return plan, findings, plan.m["actions"]
+
+
+def sql_of(actions):
+    out = []
+    for a in actions:
+        for _, stmts in a.try_variants:
+            out += stmts
+        out += a.apply
+    return "\n".join(out)
+
+
+class RemedyTests(unittest.TestCase):
+    def test_correlated_subplan_gets_index_and_rewrite(self):
+        scan = N("Seq Scan", rows=3, act=0, loops=2484, total=7.6,
+                 **{"Relation Name": "items", "Alias": "i", "Filter": "(order_id = o.id)",
+                    "Rows Removed by Filter": 200000, "Parent Relationship": "SubPlan", "Subplan Name": "SubPlan 1"})
+        agg = N("Aggregate", act=1, loops=2484, total=7.7, children=[scan],
+                **{"Parent Relationship": "SubPlan", "Subplan Name": "SubPlan 1"})
+        outer = N("Seq Scan", rows=2484, act=2484, total=20.0, **{"Relation Name": "orders", "Alias": "o"})
+        top = N("Hash Join", rows=2484, act=2484, total=20000.0, children=[outer, agg])
+        p, f, acts = actions_for(top, **{"Execution Time": 20000.0})
+        sql = sql_of(acts)
+        self.assertIn("CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_items_order_id ON items (order_id);", sql)
+        self.assertIn("CREATE INDEX idx_items_order_id ON items (order_id);", sql)   # rollback-safe variant
+        self.assertTrue(any(a.kind == "rewrite" and a.manual for a in acts))
+        self.assertTrue(all(a.stage == 2 for a in acts if a.kind in ("index", "rewrite")))
+        self.assertTrue(any(x.actions for x in f if x.rule == "seq-scan-filter"))
+
+    def test_equality_columns_before_range_column(self):
+        n = N("Seq Scan", rows=10, act=10, total=900.0,
+              **{"Relation Name": "orders", "Alias": "o", "Rows Removed by Filter": 5_000_000,
+                 "Filter": "((dow >= 10) AND (dow <= 200) AND (status = 3))"})
+        _, _, acts = actions_for(n, **{"Execution Time": 900.0})
+        self.assertIn("ON orders (status, dow)", sql_of(acts))
+
+    def test_expression_and_trigram_indexes(self):
+        n = N("Seq Scan", rows=10, act=10, total=900.0,
+              **{"Relation Name": "users", "Rows Removed by Filter": 5_000_000,
+                 "Filter": "((lower((email)::text) = 'a'::text) AND (name ~~ '%bob%'::text))"})
+        _, _, acts = actions_for(n, **{"Execution Time": 900.0})
+        sql = sql_of(acts)
+        self.assertIn("(lower(email))", sql)
+        self.assertIn("USING gin (name gin_trgm_ops)", sql)
+        self.assertIn("CREATE EXTENSION IF NOT EXISTS pg_trgm;", sql)
+
+    def test_no_index_suggested_when_filter_keeps_half_the_rows(self):
+        n = N("Seq Scan", rows=500000, act=500000, total=900.0,
+              **{"Relation Name": "o", "Filter": "(amt < 50)", "Rows Removed by Filter": 500000})
+        _, _, acts = actions_for(n, **{"Execution Time": 900.0})
+        self.assertFalse([a for a in acts if a.kind == "index"])
+
+    def test_correlated_columns_get_extended_statistics_and_analyze_first(self):
+        scan = N("Seq Scan", rows=17, act=2000, total=8.0, **{"Relation Name": "t", "Rows Removed by Filter": 198000,
+                 "Filter": "((a = 1) AND (b = 1))", "Parent Relationship": "Outer"})
+        top = N("Nested Loop", rows=17, act=2000, total=10.0, children=[scan,
+              N("Index Scan", rows=1, act=1, loops=2000, **{"Relation Name": "d", "Index Name": "i",
+                "Index Cond": "(id = t.k)", "Parent Relationship": "Inner"})])
+        _, _, acts = actions_for(top, **{"Execution Time": 10.0})
+        sql = sql_of(acts)
+        self.assertIn("CREATE STATISTICS stx_t_a_b ON a, b FROM t;", sql)
+        self.assertIn("ANALYZE t;", sql)
+        analyze = next(a for a in acts if a.key.startswith("analyze:"))
+        self.assertEqual(analyze.stage, 1)
+        self.assertEqual(acts[0].id, "A1")
+        self.assertLess(acts.index(analyze), acts.index(next(a for a in acts if a.kind == "statistics")))
+
+    def test_sort_spill_variants_and_set_local(self):
+        s = N("Sort", act=5, total=50.0, **{"Sort Method": "external merge", "Sort Space Type": "Disk",
+                                             "Sort Space Used": 21472, "Sort Key": ["t.a", "t.b DESC"],
+                                             "Parent Relationship": "Outer"},
+              children=[N("Seq Scan", act=5, **{"Relation Name": "t", "Alias": "t"})])
+        _, _, acts = actions_for(s, **{"Execution Time": 50.0})
+        wm = next(a for a in acts if a.key.startswith("workmem:sort"))
+        self.assertEqual([lbl for lbl, _ in wm.try_variants], ["work_mem 42MB", "work_mem 84MB", "work_mem 168MB"])
+        self.assertTrue(all(s_[0].startswith("SET LOCAL work_mem") for _, s_ in wm.try_variants))
+        self.assertIn("ON t (t.a, t.b DESC)".replace("t.a", "a").replace("t.b", "b"), sql_of(acts))
+
+    def test_heap_fetches_vacuum_is_not_transactional(self):
+        n = N("Index Only Scan", rows=5000, act=5000, **{"Heap Fetches": 5000, "Relation Name": "t"})
+        _, _, acts = actions_for(n)
+        v = next(a for a in acts if a.kind == "maintenance")
+        self.assertFalse(v.transactional)
+        self.assertEqual(v.stage, 1)
+
+    def test_nested_loop_diagnostic_is_flagged_not_deployable(self):
+        outer = N("Seq Scan", rows=10, act=50000, total=40.0, **{"Relation Name": "t", "Parent Relationship": "Outer"})
+        inner = N("Index Scan", rows=1, act=1, loops=50000, total=0.01,
+                  **{"Relation Name": "d", "Index Name": "i", "Parent Relationship": "Inner"})
+        _, _, acts = actions_for(N("Nested Loop", rows=10, act=50000, total=600.0, children=[outer, inner]),
+                                 **{"Execution Time": 600.0})
+        d = next(a for a in acts if a.diagnostic_only)
+        self.assertEqual(d.apply, [])
+        self.assertIn("DIAGNOSTIC ONLY", " ".join(d.caveats))
+
+    def test_planned_hash_batches_point_at_estimate_fix(self):
+        scan = N("Seq Scan", rows=5_000_000_000, act=40_000, total=5.0,
+                 **{"Relation Name": "big", "Filter": "((a = 1) AND (b = 2))"})
+        h = N("Hash", rows=5_000_000_000, act=40_000, total=6.0, children=[scan],
+              **{"Plan Width": 100, "Peak Memory Usage": 95232, "Hash Batches": 64, "Original Hash Batches": 64})
+        _, _, acts = actions_for(N("Hash Join", rows=10, act=10, total=20.0,
+                                   children=[N("Seq Scan", rows=10, act=10, **{"Relation Name": "p"}), h]))
+        self.assertTrue(any(a.key.startswith("analyze:") and "big" in a.key for a in acts))
+        self.assertFalse(any(a.key.startswith("workmem:hash") for a in acts))
+
+
+class ExperimentAndCompareTests(unittest.TestCase):
+    def _acts(self):
+        n = N("Seq Scan", rows=10, act=10, total=900.0,
+              **{"Relation Name": "orders", "Rows Removed by Filter": 5_000_000, "Filter": "(status = 3)"})
+        v = N("Index Only Scan", rows=5000, act=5000, **{"Heap Fetches": 5000, "Relation Name": "t"})
+        p1, _, a1 = actions_for(n, **{"Execution Time": 900.0})
+        _, _, a2 = actions_for(v)
+        return a1 + a2
+
+    def test_script_runs_each_try_in_a_rolled_back_transaction(self):
+        import tempfile
+        from explain_analyzer.experiments import generate
+        acts = self._acts()
+        with tempfile.TemporaryDirectory() as d:
+            man = generate(acts, d, source="plan.json")
+            sql = (Path(d) / "experiments.sql").read_text()
+            self.assertEqual(sql.count("BEGIN;"), sql.count("ROLLBACK;"))
+            self.assertIn("out/warmup.json", sql)           # cache warm-up before the measured baseline
+            self.assertLess(sql.index("out/warmup.json"), sql.index("out/baseline.json"))
+            self.assertIn("CREATE INDEX idx_orders_status ON orders (status);", sql)
+            self.assertNotIn("CONCURRENTLY", sql)            # cannot run in a transaction
+            v = sql.index("VACUUM (ANALYZE) t;")             # maintenance sits outside any transaction
+            self.assertTrue(sql[:v].count("BEGIN;") == sql[:v].count("ROLLBACK;"))
+            self.assertTrue((Path(d) / "query.sql").exists())
+            self.assertTrue(all(e["file"].startswith("out/") for e in man["experiments"]))
+            self.assertEqual(json.loads((Path(d) / "manifest.json").read_text())["baseline"], "out/baseline.json")
+
+    def test_compare_picks_smallest_change_with_nearly_all_the_gain(self):
+        import tempfile
+        from explain_analyzer.compare import compare_files
+        def plan(ms):
+            return json.dumps([{"Plan": N("Seq Scan", act=1, total=ms, **{"Relation Name": "t"}), "Execution Time": ms}])
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            (d / "base.json").write_text(plan(1000.0))
+            (d / "same.json").write_text(plan(1000.0))
+            (d / "fast.json").write_text(plan(10.0))
+            (d / "bad.json").write_text("")
+            text, rows = compare_files([d / "base.json", d / "same.json", d / "fast.json", d / "bad.json"], Config())
+        by = {r["label"]: r for r in rows}
+        self.assertEqual(by["same.json"]["verdict"], "no change")
+        self.assertEqual(by["fast.json"]["verdict"], "FASTER")
+        self.assertIn("100.0x faster", text)
+        self.assertTrue(by["bad.json"]["verdict"].startswith("FAILED"))
+
+    def test_cli_script_and_text_action_plan(self):
+        import io, contextlib, tempfile
+        with tempfile.TemporaryDirectory() as d:
+            buf, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err):
+                rc = main([str(FIX / "real_nl.json"), "--script", d, "--color", "never"])
+            self.assertEqual(rc, 0)
+            self.assertIn("== Action plan", buf.getvalue())
+            self.assertIn("CREATE STATISTICS", buf.getvalue())
+            self.assertTrue((Path(d) / "experiments.sql").exists())
+            self.assertIn("--compare", err.getvalue())

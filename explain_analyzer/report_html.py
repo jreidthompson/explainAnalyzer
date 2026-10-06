@@ -10,6 +10,7 @@ from typing import Any
 
 from .context import describe, join_on, join_sides, keys
 from .model import Finding, Node, Plan, SEVERITY_NAMES
+from .remedies import STAGES
 from .report_text import summary_lines
 
 
@@ -46,9 +47,18 @@ def build_data(plan: Plan, findings: list[Finding]) -> dict[str, Any]:
         "analyzed": plan.m["analyzed"],
         "summary": summary_lines(plan),
         "nodes": nodes,
+        "stages": {str(k): v for k, v in STAGES.items()},
+        "actions": [{"id": a.id, "kind": a.kind, "stage": a.stage, "title": a.title, "why": a.why,
+                     "confidence": a.confidence, "impact": round(a.impact_ms, 1), "caveats": a.caveats,
+                     "verify": a.verify, "diagnostic": a.diagnostic_only, "manual": a.manual,
+                     "transactional": a.transactional, "nodes": a.nodes,
+                     "try": [{"label": l, "sql": "\n".join(s)} for l, s in a.try_variants],
+                     "apply": "\n".join(a.apply), "read": "\n\n".join(a.investigate_sql)}
+                    for a in plan.m.get("actions", [])],
         "findings": [{"rule": f.rule, "sev": f.severity, "sevName": SEVERITY_NAMES[f.severity],
                       "title": f.title, "detail": f.detail, "suggestion": f.suggestion, "ctx": f.context,
-                      "node": f.node_id, "impact": round(f.impact_ms, 3)} for f in findings],
+                      "actions": f.actions, "node": f.node_id, "impact": round(f.impact_ms, 3)}
+                     for f in findings],
     }
 
 
@@ -84,12 +94,24 @@ td.nm,th.nm{min-width:240px}td{vertical-align:top}.kv{display:block}.kv b{color:
 .tree{font-family:ui-monospace,monospace;font-size:13px}.tree div.n{padding:1px 4px;border-radius:4px;cursor:pointer;white-space:nowrap}
 .tree div.n:hover{background:var(--card)}.tree .sel{background:var(--hl)}
 .t{display:inline-block;width:14px;color:var(--mut)}.mut{color:var(--mut)}
-.on{color:var(--i)}.tag3{color:var(--c)}.tag2{color:var(--w)}.tag1{color:var(--i)}
+.on{color:var(--i)}
+.stage{font-weight:600;margin:14px 0 6px;color:var(--i)}
+.act{margin:8px 0}.act h3{font-size:14px;margin:0 0 4px}.act .why{margin:2px 0 6px}
+.badge{display:inline-block;font-size:11px;padding:1px 6px;border-radius:9px;border:1px solid var(--bd);margin-right:4px;color:var(--mut)}
+.badge.hi{color:var(--c);border-color:var(--c)}
+.sql{position:relative;margin:4px 0 8px}.sql pre{margin:0;padding:8px 64px 8px 8px;background:var(--bg);border:1px solid var(--bd);border-radius:6px;white-space:pre-wrap;overflow-wrap:anywhere;font:12px ui-monospace,monospace}
+.sql button{position:absolute;top:4px;right:4px;font-size:11px;cursor:pointer}
+.sql .lbl{font-size:12px;color:var(--mut);margin-top:4px}
+.act ul{margin:4px 0 4px 18px;padding:0;color:var(--mut)}.act .vf{margin-top:4px}
+.fix a{color:var(--i);cursor:pointer;margin-right:6px}.tag3{color:var(--c)}.tag2{color:var(--w)}.tag1{color:var(--i)}
 #props{white-space:pre-wrap;font-family:ui-monospace,monospace;font-size:12px;overflow-wrap:anywhere}
 </style></head><body>
 <h1>__TITLE__</h1>
 <div class="card sum" id="sum"></div>
 <h2>Findings</h2><div id="finds"></div>
+<h2>Action plan <span class="mut">(work top to bottom; re-capture the plan after each stage)</span></h2>
+<div id="actions"></div>
+<div class="card" id="flow"></div>
 <h2>Plan tree <span class="mut">(click to select; click arrow to collapse)</span></h2>
 <div class="card tree" id="tree"></div>
 <h2>Selected node</h2><div class="card" id="props">Click a node or finding.</div>
@@ -119,6 +141,44 @@ function select(id){
   p.textContent=s;
   const row=document.querySelector('#tbl tr[data-id="'+id+'"]');if(row)row.scrollIntoView({block:'nearest'});
 }
+
+function copyText(text,btn){
+  const ok=()=>{btn.textContent='Copied';setTimeout(()=>{btn.textContent='Copy'},1200)};
+  const fb=()=>{const t=document.createElement('textarea');t.value=text;t.style.position='fixed';t.style.opacity='0';document.body.appendChild(t);t.select();try{document.execCommand('copy');ok()}catch(e){btn.textContent='Select manually'}t.remove()};
+  if(navigator.clipboard&&window.isSecureContext){navigator.clipboard.writeText(text).then(ok,fb)}else fb();
+}
+function sqlBlock(parent,label,text){
+  if(label)parent.appendChild(el('div','lbl',label));
+  const w=el('div','sql');w.appendChild(el('pre',null,text));
+  const b=el('button',null,'Copy');b.onclick=()=>copyText(text,b);w.appendChild(b);parent.appendChild(w);
+}
+function drawActions(){
+  const host=$('actions');
+  if(!D.actions.length){host.appendChild(el('div','card','Nothing actionable was derived from the findings.'));return}
+  let stage=null;
+  D.actions.forEach(a=>{
+    if(a.stage!==stage){stage=a.stage;host.appendChild(el('div','stage','Stage '+stage+': '+D.stages[stage]))}
+    const c=el('div','card act');c.id='act-'+a.id;
+    const h=el('h3');h.appendChild(el('span','badge hi',a.id));h.appendChild(document.createTextNode(a.title));c.appendChild(h);
+    const meta=el('div');
+    [a.kind,'confidence '+a.confidence].forEach(x=>meta.appendChild(el('span','badge',x)));
+    if(a.impact)meta.appendChild(el('span','badge','~'+fmt(a.impact)+' ms at stake'));
+    if(a.diagnostic)meta.appendChild(el('span','badge hi','DIAGNOSTIC ONLY - do not deploy'));
+    if(a.manual)meta.appendChild(el('span','badge','manual change'));
+    c.appendChild(meta);
+    c.appendChild(el('div','why',a.why));
+    a.try.forEach(t=>sqlBlock(c,(a.transactional?'Try it (run inside BEGIN ... ROLLBACK): ':'Try it (NOT rolled back - maintenance): ')+t.label,t.sql));
+    if(a.apply)sqlBlock(c,'Apply for real:',a.apply);
+    if(a.read)sqlBlock(c,'Run / read:',a.read);
+    if(a.caveats.length){const u=el('ul');a.caveats.forEach(x=>u.appendChild(el('li',null,x)));c.appendChild(u)}
+    if(a.verify)c.appendChild(el('div','vf','Verify: '+a.verify));
+    if(a.nodes.length){const f=el('div','mut','Fixes findings on node(s): '+a.nodes.map(n=>'#'+n).join(', '));c.appendChild(f)}
+    host.appendChild(c);
+  });
+  const fl=$('flow');
+  fl.appendChild(el('div',null,'Fastest way to test all of this: let the tool run every "Try it" for you and rank the results.'));
+  sqlBlock(fl,null,'python -m explain_analyzer PLAN_FILE --script exp --query query.sql\ncd exp && psql -X -d DATABASE -f experiments.sql\ncd .. && python -m explain_analyzer --compare exp');
+}
 D.summary.forEach(s=>$('sum').appendChild(el('div',null,s)));
 if(!D.findings.length)$('finds').appendChild(el('div','card','No problems detected.'));
 D.findings.forEach(f=>{
@@ -129,6 +189,7 @@ D.findings.forEach(f=>{
   if(f.detail)d.appendChild(el('div','d',f.detail));
   if(f.ctx&&f.ctx.length){const c=el('div','ctx');f.ctx.forEach(x=>c.appendChild(el('div',null,x)));d.appendChild(c)}
   if(f.suggestion)d.appendChild(el('div','sg','\u2192 '+f.suggestion));
+  if(f.actions&&f.actions.length){const fx=el('div','fix','Fix: ');f.actions.forEach(id=>{const a=el('a',null,id);a.onclick=e=>{e.stopPropagation();const t=document.getElementById('act-'+id);if(t)t.scrollIntoView({block:'center'})};fx.appendChild(a)});d.appendChild(fx)}
   if(f.node!=null)d.onclick=()=>select(f.node);
   $('finds').appendChild(d);
 });
@@ -153,6 +214,7 @@ function drawTree(n,depth,parent){
   if(n.sub&&depth>=0){}
   k.forEach(c=>{if(c.sub){const s=el('div','mut',c.sub);s.style.paddingLeft=((depth+1)*18+14)+'px';box.appendChild(s)}drawTree(c,depth+1,box)});
 }
+drawActions();
 drawTree(D.nodes[0],0,$('tree'));
 const cols=[['id','#',0],['label','Node','nm'],['excl_ms','Excl ms',0],['excl_pct','Excl %',0],['incl_ms','Incl ms',0],['loops','Loops',0],['est','Est rows',0],['act','Act rows',0],['mis','Misest \u00d7',0],['read','Shared read',0],['hit','Shared hit',0],['on','Join / lookup on','w'],['sides','Tables joined','w'],['keys','Keys','w']];
 let sortKey='excl_ms',sortDir=-1;
