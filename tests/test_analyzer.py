@@ -391,3 +391,29 @@ class QualifyTests(unittest.TestCase):
     def test_join_line_uses_qualified_inner_cond(self):
         (p, f), = analyze_text((FIX / "real_nl.json").read_text())
         self.assertIn("on: (d.id = t.k)", report_text.render(p, f))
+
+
+class KeysDisplayTests(unittest.TestCase):
+    def _plan(self):
+        scan = N("Seq Scan", rows=10, act=10, **{"Relation Name": "t", "Alias": "t", "Filter": "(x > 5)"})
+        srt = N("Sort", rows=10, act=10, total=3.0, children=[scan],
+                **{"Sort Key": ["t.a", "t.b DESC"], "Sort Method": "external merge",
+                   "Sort Space Type": "Disk", "Sort Space Used": 2048})
+        agg = N("Aggregate", rows=5, act=5, total=4.0, children=[srt], **{"Strategy": "Sorted", "Group Key": ["t.a"]})
+        return run(agg)
+
+    def test_text_tree_shows_sort_group_filter_keys(self):
+        p, f = self._plan()
+        out = report_text.render(p, f)
+        for expected in ("group: t.a", "sort: t.a, t.b DESC", "filter: (x > 5)",
+                         "sort ran: external merge, Disk 2.0MB"):
+            self.assertIn(expected, out)
+
+    def test_html_has_keys_and_wide_table(self):
+        p, f = self._plan()
+        data = report_html.build_data(p, f)
+        self.assertIn(["sort", "t.a, t.b DESC"], data["nodes"][1]["keys"])
+        html = report_html.render(p, f)
+        self.assertIn("'Keys'", html)
+        self.assertNotIn("max-width:1300px", html)
+        self.assertNotIn("row.nextSibling", html)

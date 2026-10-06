@@ -176,3 +176,54 @@ def join_sides(n: Node, maxlen: int = 110) -> str:
     a += f" (+{ta - 3})" if ta > 3 else ""
     b += f" (+{tb - 3})" if tb > 3 else ""
     return _clip(f"{a}  <->  {b}", maxlen)
+
+
+def _join_val(v) -> str:
+    return ", ".join(str(x) for x in v) if isinstance(v, list) else str(v)
+
+
+def _kb(kb) -> str:
+    kb = float(kb)
+    return f"{kb / 1024 ** 2:.1f}GB" if kb >= 1024 ** 2 else f"{kb / 1024:.1f}MB" if kb >= 1024 else f"{kb:.0f}kB"
+
+
+def keys(n: Node, maxlen: int = 160) -> list[tuple[str, str]]:
+    """(label, value) pairs for the keys that matter on this node: sort/group/presorted/cache
+    keys, scan filters, and how a sort/hash/aggregate actually ran."""
+    p = n.props
+    out: list[tuple[str, str]] = []
+
+    def add(label: str, key: str) -> None:
+        v = p.get(key)
+        if v not in (None, "", []):
+            out.append((label, _clip(_join_val(v), maxlen)))
+
+    add("sort", "Sort Key")
+    add("presorted", "Presorted Key")
+    add("group", "Group Key")
+    if p.get("Grouping Sets"):
+        sets = []
+        for gs in p["Grouping Sets"]:
+            gk = gs.get("Group Key") if isinstance(gs, dict) else None
+            if gk:
+                sets.append("(" + _join_val(gk) + ")")
+        if sets:
+            out.append(("grouping sets", _clip(" ".join(sets), maxlen)))
+    add("hash keys", "Hash Key")
+    add("cache key", "Cache Key")
+    add("order by", "Order By")
+    if n.node_type not in JOINS:
+        add("filter", "Filter")
+    add("recheck", "Recheck Cond")
+    # how it ran
+    if p.get("Sort Method"):
+        space = p.get("Sort Space Used")
+        out.append(("sort ran", f"{p['Sort Method']}" + (f", {p.get('Sort Space Type', '')} {_kb(space)}" if space else "")))
+    if p.get("Hash Batches") is not None:
+        b = p["Hash Batches"]
+        o = p.get("Original Hash Batches")
+        out.append(("hash ran", f"{b} batch(es)" + (f" (planned {o})" if o not in (None, b) else "")
+                    + (f", peak {_kb(p['Peak Memory Usage'])}" if p.get("Peak Memory Usage") else "")))
+    if p.get("Disk Usage"):
+        out.append(("agg spill", f"disk {_kb(p['Disk Usage'])}, {p.get('HashAgg Batches', '?')} batch(es)"))
+    return out

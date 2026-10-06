@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from .context import describe, join_on, join_sides
+from .context import describe, join_on, join_sides, keys
 from .model import Finding, Node, Plan, SEVERITY_NAMES
 from .report_text import summary_lines
 
@@ -39,6 +39,7 @@ def build_data(plan: Plan, findings: list[Finding]) -> dict[str, Any]:
             "read": m["buf_excl"].get("Shared Read Blocks", 0),
             "hit": m["buf_excl"].get("Shared Hit Blocks", 0),
             "ctx": describe(n), "on": join_on(n, 400), "sides": join_sides(n, 300),
+            "keys": [[a, b] for a, b in keys(n, 400)],
             "props": _scalar_props(n),
         })
     return {
@@ -65,7 +66,7 @@ _TEMPLATE = r"""<!doctype html>
 <style>
 :root{--bg:#fff;--fg:#1d2330;--mut:#6b7385;--card:#f5f6f9;--bd:#d9dce4;--c:#c4281c;--w:#b36b00;--i:#1b6ca8;--hl:#fff3b0}
 @media (prefers-color-scheme:dark){:root{--bg:#14171f;--fg:#e4e7ee;--mut:#9aa2b5;--card:#1d212c;--bd:#323848;--c:#ff6b5e;--w:#f0b04a;--i:#62b0ee;--hl:#4a4310}}
-body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 system-ui,sans-serif;padding:16px;max-width:1300px;margin:auto}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 system-ui,sans-serif;padding:16px}
 h1{font-size:20px;margin:0 0 8px}h2{font-size:16px;margin:24px 0 8px}
 .card{background:var(--card);border:1px solid var(--bd);border-radius:8px;padding:10px 12px}
 .sum div{font-family:ui-monospace,monospace;font-size:13px}
@@ -74,14 +75,17 @@ h1{font-size:20px;margin:0 0 8px}h2{font-size:16px;margin:24px 0 8px}
 .f .d{color:var(--mut);margin-top:2px}.ctx{margin-top:4px;padding-left:8px;border-left:2px solid var(--bd);font-family:ui-monospace,monospace;font-size:12px;color:var(--mut);overflow-wrap:anywhere}.f .sg{margin-top:2px}
 table{border-collapse:collapse;width:100%;font-size:13px}th,td{border-bottom:1px solid var(--bd);padding:4px 6px;text-align:right;white-space:nowrap}
 th{cursor:pointer;position:sticky;top:0;background:var(--card);user-select:none}
-td.l,th.l{text-align:left;white-space:normal}tr.sel td{background:var(--hl)}tr.never td{color:var(--mut)}
+td.l,th.l{text-align:left;white-space:normal;vertical-align:top}
+td.w,th.w{min-width:280px;max-width:560px;white-space:normal;overflow-wrap:anywhere;text-align:left;vertical-align:top;font-family:ui-monospace,monospace;font-size:12px}
+td.nm,th.nm{min-width:240px}td{vertical-align:top}.kv{display:block}.kv b{color:var(--mut);font-weight:600}
+.tree div.k{padding-left:0;color:var(--mut);font-size:12px;white-space:normal;overflow-wrap:anywhere;cursor:pointer}
+.wrap{max-height:80vh;overflow:auto}tr.sel td{background:var(--hl)}tr.never td{color:var(--mut)}
 .bar{display:inline-block;height:8px;background:var(--c);border-radius:2px;vertical-align:middle;margin-right:4px}
 .tree{font-family:ui-monospace,monospace;font-size:13px}.tree div.n{padding:1px 4px;border-radius:4px;cursor:pointer;white-space:nowrap}
 .tree div.n:hover{background:var(--card)}.tree .sel{background:var(--hl)}
 .t{display:inline-block;width:14px;color:var(--mut)}.mut{color:var(--mut)}
 .on{color:var(--i)}.tag3{color:var(--c)}.tag2{color:var(--w)}.tag1{color:var(--i)}
 #props{white-space:pre-wrap;font-family:ui-monospace,monospace;font-size:12px;overflow-wrap:anywhere}
-.wrap{overflow-x:auto}
 </style></head><body>
 <h1>__TITLE__</h1>
 <div class="card sum" id="sum"></div>
@@ -142,28 +146,30 @@ function drawTree(n,depth,parent){
   else st='rows '+fmt(n.est)+'  cost '+fmt(n.cost_pct)+'%';
   row.appendChild(el('span','mut',st));
   if(n.on){const o=el('span','on','   on '+n.on);row.appendChild(o)}
-  row.onclick=e=>{if(e.target===tog&&k.length){const box=row.nextSibling;const hide=box.style.display!=='none';box.style.display=hide?'none':'';tog.textContent=hide?'\u25B8':'\u25BE'}else select(n.id)};
+  row.onclick=e=>{if(e.target===tog&&k.length){const hide=box.style.display!=='none';box.style.display=hide?'none':'';tog.textContent=hide?'\u25B8':'\u25BE'}else select(n.id)};
   parent.appendChild(row);
+  if(n.keys.length){const kd=el('div','k');kd.style.paddingLeft=(depth*18+34)+'px';kd.dataset.id=n.id;kd.textContent=n.keys.map(([a,b])=>a+': '+b).join('  |  ');kd.onclick=()=>select(n.id);parent.appendChild(kd)}
   const box=el('div');parent.appendChild(box);
   if(n.sub&&depth>=0){}
   k.forEach(c=>{if(c.sub){const s=el('div','mut',c.sub);s.style.paddingLeft=((depth+1)*18+14)+'px';box.appendChild(s)}drawTree(c,depth+1,box)});
 }
 drawTree(D.nodes[0],0,$('tree'));
-const cols=[['id','#',0],['label','Node',1],['excl_ms','Excl ms',0],['excl_pct','Excl %',0],['incl_ms','Incl ms',0],['loops','Loops',0],['est','Est rows',0],['act','Act rows',0],['mis','Misest \u00d7',0],['read','Shared read',0],['hit','Shared hit',0],['on','Join / lookup on',1],['sides','Tables joined',1]];
+const cols=[['id','#',0],['label','Node','nm'],['excl_ms','Excl ms',0],['excl_pct','Excl %',0],['incl_ms','Incl ms',0],['loops','Loops',0],['est','Est rows',0],['act','Act rows',0],['mis','Misest \u00d7',0],['read','Shared read',0],['hit','Shared hit',0],['on','Join / lookup on','w'],['sides','Tables joined','w'],['keys','Keys','w']];
 let sortKey='excl_ms',sortDir=-1;
 function drawTable(){
   const t=$('tbl');t.textContent='';
   const hr=el('tr');
-  cols.forEach(([k,name,left])=>{const th=el('th',left?'l':'',name+(k===sortKey?(sortDir<0?' \u25BE':' \u25B4'):''));th.onclick=()=>{if(sortKey===k)sortDir=-sortDir;else{sortKey=k;sortDir=left?1:-1}drawTable()};hr.appendChild(th)});
+  cols.forEach(([k,name,left])=>{const th=el('th',left===1?'l':(left||''),name+(k===sortKey?(sortDir<0?' \u25BE':' \u25B4'):''));th.onclick=()=>{if(sortKey===k)sortDir=-sortDir;else{sortKey=k;sortDir=left?1:-1}drawTable()};hr.appendChild(th)});
   t.appendChild(hr);
-  const rows=D.nodes.slice().sort((a,b)=>{const x=a[sortKey],y=b[sortKey];return (x==null?-1:x)>(y==null?-1:y)?sortDir:(x==y?0:-sortDir)});
+  const rows=D.nodes.slice().sort((a,b)=>{const sv=v=>Array.isArray(v)?v.map(p=>p.join(' ')).join(' '):v;const x=sv(a[sortKey]),y=sv(b[sortKey]);return (x==null?-1:x)>(y==null?-1:y)?sortDir:(x==y?0:-sortDir)});
   rows.forEach(n=>{
     const tr=el('tr',n.never?'never':'');tr.dataset.id=n.id;tr.onclick=()=>select(n.id);
     cols.forEach(([k,,left])=>{
-      const td=el('td',left?'l':'');
+      const td=el('td',left===1?'l':(left||''));
       if(k==='excl_pct'){const b=el('span','bar');b.style.width=Math.min(60,n.excl_pct*0.6)+'px';td.appendChild(b);td.appendChild(document.createTextNode(fmt(n.excl_pct,1)))}
       else if(k==='mis')td.textContent=n.mis>1&&!n.mis_ignored?fmt(n.mis)+' '+(n.mis_dir||''):'';
       else if(k==='on'||k==='sides')td.textContent=n[k]||'';
+      else if(k==='keys')n.keys.forEach(([a,b])=>{const d=el('span','kv');d.appendChild(el('b',null,a+': '));d.appendChild(document.createTextNode(b));td.appendChild(d)});
       else td.textContent=(k==='label'||k==='id')?(k==='id'?n.id:n.label):fmt(n[k],k==='excl_ms'||k==='incl_ms'?2:0);
       tr.appendChild(td)});
     t.appendChild(tr)});

@@ -1,7 +1,7 @@
 """Terminal report: summary, ranked findings, annotated plan tree."""
 from __future__ import annotations
 
-from .context import join_on, join_sides
+from .context import join_on, join_sides, keys
 from .model import Finding, Node, Plan, SEVERITY_NAMES
 
 _COL = {1: "36", 2: "33", 3: "1;31"}
@@ -99,6 +99,8 @@ def _tree(n: Node, out: list[str], prefix: str, last: bool, plan: Plan,
         out.append(_c(f"{child_prefix}      on: {on}", "2", color))
     if sides:
         out.append(_c(f"{child_prefix}      tables: {sides}", "2", color))
+    for label, val in keys(n):
+        out.append(_c(f"{child_prefix}      {label}: {val}", "2", color))
     for i, c in enumerate(n.children):
         crel = c.get("Subplan Name") or ""
         if crel:
