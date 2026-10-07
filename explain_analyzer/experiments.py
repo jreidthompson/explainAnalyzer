@@ -48,25 +48,41 @@ def _needs(stmts: list[str]) -> list[str]:
     return found
 
 
-def _search_path_sql(names: list[str], schema: str | None) -> str:
-    """psql query that stores the search_path to use in variable :sp.
+def _search_path_sql(names: list[str], schema: str | None, qualified: list[tuple[str, str]] | None = None) -> str:
+    """psql statements that store the search_path to use in variable :sp (and flag ambiguous names).
 
     ``psql -X`` skips ~/.psqlrc, which is where many people set search_path, so tables that the plan shows
     without a schema (they were visible on the capturing session's path) would not be found. Resolve the
     schemas from the live catalog and put them in front of the current path.
+
+    A name that exists in several schemas is ambiguous - the offline tool cannot know which one the capturing
+    session meant. We pick the schema that is visible on the current path (what an unqualified reference means
+    for a default session), never one the plan itself shows qualified (so an unqualified `orders` cannot be
+    `archive.orders` when the plan prints `archive.orders` separately), and print a WARNING.
     """
-    parts: list[str] = []
     if schema:
-        parts.append(_sql_str(_qi(schema)))
-    elif names:
-        lst = ", ".join(_sql_str(n) for n in names)
-        parts.append(
-            "(SELECT string_agg(quote_ident(nspname), ', ') FROM (SELECT DISTINCT n.nspname FROM pg_class c "
+        return f"SELECT concat_ws(', ', {_sql_str(_qi(schema))}, current_setting('search_path')) AS sp \\gset"
+    excl = ""
+    if qualified:
+        pairs = ", ".join(f"({_sql_str(s)}, {_sql_str(r)})" for s, r in sorted(set(qualified)))
+        excl = f" AND (n.nspname, c.relname) NOT IN ({pairs})"
+    lst = ", ".join(_sql_str(n) for n in names)
+    cand = ("SELECT c.relname, n.nspname, pg_table_is_visible(c.oid) AS vis FROM pg_class c "
             "JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relname IN (" + lst + ") "
             "AND c.relkind IN ('r','p','m','v','f') AND n.nspname NOT LIKE 'pg\\_%' "
-            "AND n.nspname <> 'information_schema' ORDER BY n.nspname) s)")
-    parts.append("current_setting('search_path')")
-    return f"SELECT concat_ws(', ', {', '.join(parts)}) AS sp \\gset"
+            "AND n.nspname <> 'information_schema'" + excl)
+    chosen = f"(SELECT DISTINCT ON (relname) relname, nspname FROM ({cand}) x ORDER BY relname, vis DESC, nspname) y"
+    amb = (f"SELECT coalesce(string_agg(relname || ' exists in: ' || s, '; '), '') AS amb FROM (SELECT relname, "
+           f"string_agg(nspname, ', ' ORDER BY nspname) AS s, count(*) AS k FROM ({cand}) x GROUP BY relname) z WHERE k > 1")
+    return (
+        "SELECT concat_ws(', ', (SELECT string_agg(DISTINCT quote_ident(nspname), ', ') FROM " + chosen + "), "
+        "current_setting('search_path')) AS sp \\gset\n"
+        f"SELECT (amb <> '') AS has_amb, amb FROM ({amb}) w \\gset\n"
+        "\\if :has_amb\n"
+        "\\echo WARNING: ambiguous table name(s): :amb\n"
+        "\\echo WARNING: the script chose the schema visible on search_path (else the alphabetically first). If that is\n"
+        "\\echo WARNING: not the one you analyzed, re-run with --schema NAME or put SET search_path = ...; in query.sql.\n"
+        "\\endif")
 
 
 def _qi(name: str) -> str:
@@ -93,7 +109,8 @@ def _sql_str(v) -> str:
 
 def generate(remedies: list[Remedy], outdir: str | Path, query_file: str | None = None,
              source: str = "", settings: dict | None = None, relations: list[str] | None = None,
-             schema: str | None = None) -> dict:
+             schema: str | None = None, qualified: list[tuple[str, str]] | None = None,
+             fingerprint: dict | None = None) -> dict:
     out = Path(outdir)
     (out / "out").mkdir(parents=True, exist_ok=True)
     notes: list[str] = []
@@ -128,19 +145,20 @@ def generate(remedies: list[Remedy], outdir: str | Path, query_file: str | None 
         (out / "preamble.sql").unlink()
 
     use_sp = bool(schema or relations)
-    sp_line = (_search_path_sql(sorted(set(relations or [])), schema) + "\n") if use_sp else ""
+    sp_line = (_search_path_sql(sorted(set(relations or [])), schema, qualified) + "\n") if use_sp else ""
     if use_sp:
         notes.append(("tables are placed in schema " + schema) if schema else
                      "the plan has no schema for " + ", ".join(sorted(set(relations or []))[:6])
                      + ("..." if len(set(relations or [])) > 6 else "")
                      + ": the script looks their schemas up in the database at run time and puts them on search_path "
-                       "(pass --schema NAME to print schema-qualified SQL)")
+                       "(a name that exists in several schemas is ambiguous: pass --schema NAME, and check the compare output's "
+                       "baseline-reproduction warning)")
     parts = [HEADER.replace("\\set q `cat query.sql`\n",
                             "\\set q `cat query.sql`\n" + sp_line +
                             "SELECT (current_setting('hash_mem_multiplier', true) IS NOT NULL) AS has_hash_mem_multiplier \\gset\n"
                             "SELECT (current_setting('jit', true) IS NOT NULL) AS has_jit \\gset\n")]
     manifest = {"source_plan": source, "baseline": "out/baseline.json", "experiments": [], "skipped": [],
-                "notes": notes}
+                "notes": notes, "fingerprint": fingerprint or {}}
     parts.append("-- warm-up run (result discarded): warms the cache so later runs are comparable\n")
     parts.append(_block("warm-up", "out/warmup.json", ["-- (no changes)"], has_pre, use_sp))
     parts.append(_block("baseline", "out/baseline.json", ["-- (no changes)"], has_pre, use_sp))

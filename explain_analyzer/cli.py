@@ -30,6 +30,16 @@ def analyze_text(text: str, cfg: Config | None = None, sanitize: str | None = No
     return out
 
 
+def fingerprint(plan: Plan) -> dict:
+    """What a faithful re-run of this query must look like (used by --compare to detect a wrong-table baseline)."""
+    r = plan.root.m
+    return {"labels": [n.label() for n in plan.nodes],
+            "rows": r.get("act_rows") if r.get("act_rows") is not None else r.get("est_rows"),
+            "est_rows": r.get("est_rows"),
+            "scan_rows": {n.label(): (n.m["act_rows"] if n.m.get("act_rows") is not None else n.m["est_rows"])
+                          for n in plan.nodes if n.get("Relation Name")}}
+
+
 def _json_doc(plan: Plan, findings: list[Finding]) -> dict:
     return {
         "planning_time_ms": plan.planning_time,
@@ -130,7 +140,10 @@ def main(argv: list[str] | None = None) -> int:
             d = Path(args.script) if len(results) == 1 else Path(args.script) / f"plan{i + 1}"
             try:
                 rels = sorted({n.get("Relation Name") for n in plan.nodes if n.get("Relation Name") and not n.get("Schema")})
-                man = generate(plan.m.get("actions", []), d, args.query, args.file, plan.settings, rels, args.schema)
+                qual = sorted({(n.get("Schema"), n.get("Relation Name")) for n in plan.nodes
+                               if n.get("Relation Name") and n.get("Schema")})
+                man = generate(plan.m.get("actions", []), d, args.query, args.file, plan.settings, rels, args.schema,
+                               qual, fingerprint(plan))
             except (ValueError, OSError) as e:
                 print(f"error: {e}", file=sys.stderr)
                 return 1

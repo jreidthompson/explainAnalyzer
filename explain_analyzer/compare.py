@@ -61,12 +61,39 @@ def node_deltas(base: Plan, cand: Plan, top: int = 4) -> list[str]:
     return [r[1] for r in rows[:top] if abs(r[0]) >= 0.5]
 
 
-def compare(base_path: Path, cands: list[tuple[str, Path, dict]], cfg: Config) -> tuple[str, list[dict]]:
+def check_baseline(bplan: Plan, fp: dict | None) -> list[str]:
+    """Warnings when the re-run baseline is not the query that was captured (wrong schema/table, other data...)."""
+    if not fp or not fp.get("labels"):
+        return []
+    out = []
+    got = [n.label() for n in bplan.nodes]
+    want = fp["labels"]
+    diff = sum(1 for a, b in zip(got, want) if a != b) + abs(len(got) - len(want))
+    if diff:
+        first = next((f"captured '{b}' but the baseline run has '{a}'" for a, b in zip(got, want) if a != b),
+                     f"captured {len(want)} nodes, baseline run has {len(got)}")
+        out.append(f"plan shape differs from the captured plan in {diff} node(s): {first}")
+    for label, rows in (fp.get("scan_rows") or {}).items():
+        cur = next((n.m["act_rows"] if n.m.get("act_rows") is not None else n.m["est_rows"]
+                    for n in bplan.nodes if n.label() == label), None)
+        if cur is not None and rows is not None and max(cur, rows, 1) / max(min(cur, rows), 1) >= 5:
+            out.append(f"'{label}' returned {cur:,.0f} rows in the baseline run but {rows:,.0f} in the captured plan")
+            break
+    if out:
+        out.append("The baseline does not reproduce the captured plan, so the experiment results may be about a "
+                   "different table, different data or different settings. Common cause: a table name that exists "
+                   "in several schemas - re-run `--script` with --schema NAME (or SET search_path in query.sql).")
+    return out
+
+
+def compare(base_path: Path, cands: list[tuple[str, Path, dict]], cfg: Config,
+            fingerprint: dict | None = None) -> tuple[str, list[dict]]:
     """cands: (label, path, manifest entry). Returns (text, rows)."""
     b, err = _load(base_path, cfg)
     if b is None:
         return f"baseline {base_path}: {err}", []
     bplan, bfind = b
+    warnings = check_baseline(bplan, fingerprint)
     bs = summarize(bplan, bfind)
     base_ms = bs["exec_ms"] or bplan.root.m.get("incl_ms") or 0.0
     rows: list[dict] = [{"label": "baseline", "exec_ms": base_ms, "critical": bs["critical"], "warning": bs["warning"],
@@ -99,7 +126,8 @@ def compare(base_path: Path, cands: list[tuple[str, Path, dict]], cfg: Config) -
                      "resolved": len(resolved), "new": len(new),
                      "deltas": node_deltas(bplan, cplan)})
     w = max(len(r["label"]) for r in rows)
-    lines = [f"{'Experiment':<{w}}  {'exec ms':>12}  {'vs baseline':>12}  crit/warn  verdict"]
+    lines = [f"WARNING: {x}" for x in warnings] + ([""] if warnings else [])
+    lines += [f"{'Experiment':<{w}}  {'exec ms':>12}  {'vs baseline':>12}  crit/warn  verdict"]
     for r in rows:
         if r["exec_ms"] is None:
             lines.append(f"{r['label']:<{w}}  {'-':>12}  {'-':>12}  {'-':>9}  {r['verdict']}")
@@ -150,7 +178,7 @@ def compare_dir(d: Path, cfg: Config) -> tuple[str, list[dict]]:
     cands = []
     for e in man["experiments"]:
         cands.append((f"{e['id']} {e['title']} [{e['variant']}]"[:96], d / e["file"], e))
-    text, rows = compare(d / man["baseline"], cands, cfg)
+    text, rows = compare(d / man["baseline"], cands, cfg, man.get("fingerprint"))
     skipped = man.get("skipped") or []
     if skipped:
         text += "\n\nNot testable automatically (do these by hand):\n" + "\n".join(

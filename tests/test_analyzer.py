@@ -728,3 +728,60 @@ class SchemaTests(unittest.TestCase):
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
                 main([str(FIX / "real_nl.json"), "--script", d, "--color", "never"])
             self.assertIn("looks their schemas up in the database at run time", err.getvalue())
+
+
+class AmbiguousSchemaTests(unittest.TestCase):
+    def test_lookup_picks_one_visible_schema_per_name_and_skips_schemas_the_plan_shows_qualified(self):
+        from explain_analyzer.experiments import _search_path_sql
+        sql = _search_path_sql(["orders", "items"], None, [("archive", "orders")])
+        self.assertIn("DISTINCT ON (relname)", sql)
+        self.assertIn("ORDER BY relname, vis DESC, nspname", sql)         # visible on the path wins
+        self.assertIn("pg_table_is_visible(c.oid)", sql)
+        self.assertIn("NOT IN (('archive', 'orders'))", sql)              # plan printed archive.orders separately
+        self.assertIn("\\echo WARNING: ambiguous table name(s): :amb", sql)  # loud, not silent
+        self.assertIn("--schema", sql)
+
+    def test_explicit_schema_needs_no_lookup(self):
+        from explain_analyzer.experiments import _search_path_sql
+        sql = _search_path_sql(["orders"], "sales", None)
+        self.assertNotIn("pg_class", sql)
+        self.assertIn("'sales'", sql)
+
+    def test_manifest_carries_a_fingerprint_of_the_captured_plan(self):
+        import tempfile
+        (plan, _), = analyze_text((FIX / "real_nl.json").read_text())
+        from explain_analyzer.cli import fingerprint
+        from explain_analyzer.experiments import generate
+        fp = fingerprint(plan)
+        self.assertEqual(fp["labels"][0], "Nested Loop")
+        with tempfile.TemporaryDirectory() as d:
+            man = generate([], d, fingerprint=fp)
+        self.assertEqual(man["fingerprint"]["labels"], fp["labels"])
+
+    def test_compare_warns_when_the_baseline_is_not_the_captured_query(self):
+        import tempfile
+        from explain_analyzer.compare import compare_dir
+        def plan(rows, rel="events"):
+            return json.dumps([{"Plan": N("Seq Scan", rows=rows, act=rows, total=5.0, **{"Relation Name": rel}),
+                                "Execution Time": 5.0}])
+        (cap, _), = analyze_text(plan(300))
+        from explain_analyzer.cli import fingerprint
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            (d / "out").mkdir()
+            (d / "manifest.json").write_text(json.dumps({"baseline": "out/baseline.json", "experiments": [],
+                                                         "fingerprint": fingerprint(cap)}))
+            (d / "out/baseline.json").write_text(plan(10))            # wrong table: 10 rows instead of 300
+            text, _ = compare_dir(d, Config())
+            self.assertIn("WARNING:", text)
+            self.assertIn("returned 10 rows in the baseline run but 300 in the captured plan", text)
+            self.assertIn("--schema", text)
+            (d / "out/baseline.json").write_text(plan(310))           # close enough: no warning
+            text, _ = compare_dir(d, Config())
+            self.assertNotIn("WARNING", text)
+
+    def test_investigation_queries_show_the_schema(self):
+        n = N("Seq Scan", act=1, total=50.0, **{"Relation Name": "t", "Shared Read Blocks": 5000, "Shared Hit Blocks": 10})
+        _, _, acts = actions_for(n, **{"Execution Time": 50.0})
+        q = " ".join(" ".join(a.investigate_sql) for a in acts)
+        self.assertIn("SELECT schemaname, relname", q)

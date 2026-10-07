@@ -350,7 +350,7 @@ def _stats_remedy(ctx: Ctx, f: Finding, n: Node) -> None:
             caveats=["First run the ANALYZE step above, then re-capture the plan; if the error remains check "
                      "n_distinct for the join keys and for skew (most_common_freqs) with the query below."],
             investigate_sql=[
-                f"SELECT tablename, attname, n_distinct, null_frac, "
+                f"SELECT schemaname, tablename, attname, n_distinct, null_frac, "
                 f"(most_common_freqs)[1] AS top_freq FROM pg_stats WHERE tablename IN "
                 f"({', '.join(repr(t) for t in sorted({x[1] for x in jcols}) or ['<table>'])}) "
                 f"AND attname IN ({', '.join(repr(c) for c in sorted({x[2] for x in jcols}) or ['<column>'])});"],
@@ -543,7 +543,7 @@ def _investigate(ctx: Ctx, f: Finding, n: Node | None) -> None:
             title=f"Check for bloat / cold cache under #{n.id}",
             why=f.detail,
             investigate_sql=[
-                "SELECT relname, pg_size_pretty(pg_total_relation_size(relid)) AS total, n_live_tup, n_dead_tup, "
+                "SELECT schemaname, relname, pg_size_pretty(pg_total_relation_size(relid)) AS total, n_live_tup, n_dead_tup, "
                 f"last_autovacuum, last_autoanalyze FROM pg_stat_user_tables WHERE relname IN ({lst});",
                 "-- run the same EXPLAIN a second time: if reads turn into hits it was a cold cache."],
             caveats=["Dead tuples >> live tuples or a table far larger than its row count suggests means bloat: "

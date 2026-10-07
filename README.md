@@ -27,6 +27,13 @@ start of every experiment transaction, so each experiment runs under your settin
 `search_path` recorded in the plan's `Settings` and, if that is missing, looks the tables' schemas up in the database at
 run time. Pass `--schema NAME` to get schema-qualified SQL in the action plan (recommended for anything you will paste
 into production), or put `SET search_path = ...;` at the top of `query.sql`.
+
+**Same table name in several schemas.** If the plan shows the schema (it does for any table not on the capturing
+session's path, and for everything with `VERBOSE`) each table is qualified correctly. If it does not, the offline tool
+cannot tell which schema was meant, so the script picks the one visible on the search path, never one the plan shows
+qualified separately, and prints `WARNING: ambiguous table name(s)`. Because a wrong guess would silently test the wrong
+table, `--compare` also checks that the baseline re-run reproduces the captured plan (same plan shape, similar row
+counts) and prints a `WARNING` if it does not. When you see either warning, re-run `--script` with `--schema NAME`.
 Experiments that need a setting the
 server lacks (e.g. `hash_mem_multiplier` before PostgreSQL 13) are skipped instead of failing.
 
