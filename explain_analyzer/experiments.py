@@ -48,9 +48,35 @@ def _needs(stmts: list[str]) -> list[str]:
     return found
 
 
-def _block(name: str, file: str, stmts: list[str], preamble: bool = False) -> str:
+def _search_path_sql(names: list[str], schema: str | None) -> str:
+    """psql query that stores the search_path to use in variable :sp.
+
+    ``psql -X`` skips ~/.psqlrc, which is where many people set search_path, so tables that the plan shows
+    without a schema (they were visible on the capturing session's path) would not be found. Resolve the
+    schemas from the live catalog and put them in front of the current path.
+    """
+    parts: list[str] = []
+    if schema:
+        parts.append(_sql_str(_qi(schema)))
+    elif names:
+        lst = ", ".join(_sql_str(n) for n in names)
+        parts.append(
+            "(SELECT string_agg(quote_ident(nspname), ', ') FROM (SELECT DISTINCT n.nspname FROM pg_class c "
+            "JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relname IN (" + lst + ") "
+            "AND c.relkind IN ('r','p','m','v','f') AND n.nspname NOT LIKE 'pg\\_%' "
+            "AND n.nspname <> 'information_schema' ORDER BY n.nspname) s)")
+    parts.append("current_setting('search_path')")
+    return f"SELECT concat_ws(', ', {', '.join(parts)}) AS sp \\gset"
+
+
+def _qi(name: str) -> str:
+    from .remedies import qi
+    return qi(name)
+
+
+def _block(name: str, file: str, stmts: list[str], preamble: bool = False, use_sp: bool = False) -> str:
     body = "\n".join(stmts)
-    pre = "\\i preamble.sql\n" if preamble else ""
+    pre = ("SET LOCAL search_path = :sp;\n" if use_sp else "") + ("\\i preamble.sql\n" if preamble else "")
     run = f"{pre}{body}\n\\o {file}\n{EXPLAIN} :q\n;\n\\o\n"
     need = _needs(stmts)
     if need:   # only run where every versioned setting exists
@@ -66,7 +92,8 @@ def _sql_str(v) -> str:
 
 
 def generate(remedies: list[Remedy], outdir: str | Path, query_file: str | None = None,
-             source: str = "", settings: dict | None = None) -> dict:
+             source: str = "", settings: dict | None = None, relations: list[str] | None = None,
+             schema: str | None = None) -> dict:
     out = Path(outdir)
     (out / "out").mkdir(parents=True, exist_ok=True)
     notes: list[str] = []
@@ -80,11 +107,16 @@ def generate(remedies: list[Remedy], outdir: str | Path, query_file: str | None 
         (out / "query.sql").write_text("-- put the statement under test here (plain SQL, no EXPLAIN, no $1 parameters)\n",
                                        encoding="utf-8")
     # replay the non-default settings the plan was captured under (EXPLAIN SETTINGS), unless the query file sets them
-    plan_sets = [f"SET LOCAL {k} = {_sql_str(v)};" for k, v in (settings or {}).items()
-                 if re.fullmatch(r"[A-Za-z_][\w.]*", str(k)) and str(k).lower() not in set_names]
-    if plan_sets:
-        notes.append(f"replaying {len(plan_sets)} non-default setting(s) recorded in the plan: "
-                     + ", ".join(s.split()[2] for s in plan_sets))
+    # set_config(..., true) == SET LOCAL, but it parses list-valued settings (search_path = 'a, public') correctly
+    # and needs no quoting care; SET LOCAL name = 'a, public' would treat the list as ONE schema name.
+    plan_items = [(k, v) for k, v in (settings or {}).items()
+                  if re.fullmatch(r"[A-Za-z_][\w.]*", str(k)) and str(k).lower() not in set_names]
+    plan_sets = []
+    if plan_items:
+        calls = " ".join(f"PERFORM set_config({_sql_str(k)}, {_sql_str(v)}, true);" for k, v in plan_items)
+        plan_sets = [f"DO $ea$ BEGIN {calls} END $ea$;"]
+        notes.append(f"replaying {len(plan_items)} non-default setting(s) recorded in the plan: "
+                     + ", ".join(k for k, _ in plan_items))
     preamble_sql = [*(s.rstrip(";") + ";" for s in pre), *plan_sets]
     has_pre = bool(preamble_sql)
     if has_pre:
@@ -95,15 +127,23 @@ def generate(remedies: list[Remedy], outdir: str | Path, query_file: str | None 
     elif (out / "preamble.sql").exists():
         (out / "preamble.sql").unlink()
 
+    use_sp = bool(schema or relations)
+    sp_line = (_search_path_sql(sorted(set(relations or [])), schema) + "\n") if use_sp else ""
+    if use_sp:
+        notes.append(("tables are placed in schema " + schema) if schema else
+                     "the plan has no schema for " + ", ".join(sorted(set(relations or []))[:6])
+                     + ("..." if len(set(relations or [])) > 6 else "")
+                     + ": the script looks their schemas up in the database at run time and puts them on search_path "
+                       "(pass --schema NAME to print schema-qualified SQL)")
     parts = [HEADER.replace("\\set q `cat query.sql`\n",
-                            "\\set q `cat query.sql`\n"
+                            "\\set q `cat query.sql`\n" + sp_line +
                             "SELECT (current_setting('hash_mem_multiplier', true) IS NOT NULL) AS has_hash_mem_multiplier \\gset\n"
                             "SELECT (current_setting('jit', true) IS NOT NULL) AS has_jit \\gset\n")]
     manifest = {"source_plan": source, "baseline": "out/baseline.json", "experiments": [], "skipped": [],
                 "notes": notes}
     parts.append("-- warm-up run (result discarded): warms the cache so later runs are comparable\n")
-    parts.append(_block("warm-up", "out/warmup.json", ["-- (no changes)"], has_pre))
-    parts.append(_block("baseline", "out/baseline.json", ["-- (no changes)"], has_pre))
+    parts.append(_block("warm-up", "out/warmup.json", ["-- (no changes)"], has_pre, use_sp))
+    parts.append(_block("baseline", "out/baseline.json", ["-- (no changes)"], has_pre, use_sp))
 
     combo: list[str] = []
     for r in remedies:
@@ -115,10 +155,11 @@ def generate(remedies: list[Remedy], outdir: str | Path, query_file: str | None 
             fname = f"out/{r.id}_{i}.json"
             title = f"{r.id} {r.title} [{label}]"
             if not r.transactional:
-                parts.append(f"\\echo >>> {r.id}: NOT ROLLED BACK (maintenance)\n" + "\n".join(stmts) + "\n")
-                parts.append(_block(f"{title} (after maintenance)", fname, ["-- (maintenance applied above)"], has_pre))
+                sp_on, sp_off = ("SET search_path = :sp;\n", "\nRESET search_path;") if use_sp else ("", "")
+                parts.append(f"\\echo >>> {r.id}: NOT ROLLED BACK (maintenance)\n{sp_on}" + "\n".join(stmts) + sp_off + "\n")
+                parts.append(_block(f"{title} (after maintenance)", fname, ["-- (maintenance applied above)"], has_pre, use_sp))
             else:
-                parts.append(_block(title, fname, stmts, has_pre))
+                parts.append(_block(title, fname, stmts, has_pre, use_sp))
             manifest["experiments"].append({
                 "id": f"{r.id}_{i}", "remedy": r.id, "title": r.title, "variant": label, "file": fname,
                 "kind": r.kind, "stage": r.stage, "apply": r.apply, "diagnostic_only": r.diagnostic_only,
@@ -129,7 +170,7 @@ def generate(remedies: list[Remedy], outdir: str | Path, query_file: str | None 
     structural = [r for r in remedies if r.transactional and not r.diagnostic_only
                   and r.kind in ("index", "statistics", "maintenance") and r.try_variants]
     if len(structural) >= 2:
-        parts.append(_block("COMBINED: all index/statistics/ANALYZE actions together", "out/combined.json", combo, has_pre))
+        parts.append(_block("COMBINED: all index/statistics/ANALYZE actions together", "out/combined.json", combo, has_pre, use_sp))
         manifest["experiments"].append({
             "id": "combined", "remedy": ",".join(r.id for r in structural),
             "title": "All index/statistics/ANALYZE actions together", "variant": "combined",

@@ -641,8 +641,8 @@ class QueryFileTests(unittest.TestCase):
             exp = Path(d) / "exp"
             pre = (exp / "preamble.sql").read_text()
             self.assertIn("SET work_mem = '6GB';", pre)
-            self.assertIn("SET LOCAL random_page_cost = '1.1';", pre)
-            self.assertNotIn("SET LOCAL work_mem", pre)            # the query file already sets it
+            self.assertIn("PERFORM set_config('random_page_cost', '1.1', true);", pre)
+            self.assertNotIn("set_config('work_mem'", pre)         # the query file already sets it
             sql = (exp / "experiments.sql").read_text()
             self.assertEqual(sql.count("\\i preamble.sql"), sql.count("BEGIN;"))
             self.assertEqual((exp / "query.sql").read_text().strip(), "SELECT * FROM orders WHERE status = 3")
@@ -655,3 +655,76 @@ class QueryFileTests(unittest.TestCase):
         self.assertIn("\\else", blk)
         self.assertEqual(blk.count("\\if"), blk.count("\\endif"))
         self.assertNotIn("\\if", _block("t", "out/x.json", ["SET LOCAL work_mem = '1GB';"]))
+
+
+class SchemaTests(unittest.TestCase):
+    def _scan_plan(self, **props):
+        return N("Seq Scan", rows=10, act=10, total=900.0,
+                 **{"Relation Name": "orders", "Rows Removed by Filter": 5_000_000, "Filter": "(status = 3)", **props})
+
+    def test_script_resolves_schemas_at_run_time_when_the_plan_has_none(self):
+        import tempfile
+        from explain_analyzer.experiments import generate
+        p, f, acts = actions_for(self._scan_plan(), **{"Execution Time": 900.0})
+        with tempfile.TemporaryDirectory() as d:
+            generate(acts, d, relations=["orders", "items"])
+            sql = (Path(d) / "experiments.sql").read_text()
+        self.assertIn("c.relname IN ('items', 'orders')", sql)
+        self.assertIn("current_setting('search_path')", sql)       # existing path is kept behind the resolved schemas
+        self.assertIn("\\gset", sql)
+        self.assertEqual(sql.count("SET LOCAL search_path = :sp;"), sql.count("BEGIN;"))
+        self.assertLess(sql.index("SET LOCAL search_path = :sp;"), sql.index("CREATE INDEX idx_orders_status"))
+
+    def test_search_path_is_set_before_the_preamble_so_the_captured_path_wins(self):
+        from explain_analyzer.experiments import _block
+        blk = _block("t", "out/x.json", ["SELECT 1;"], preamble=True, use_sp=True)
+        self.assertLess(blk.index("SET LOCAL search_path = :sp;"), blk.index("\\i preamble.sql"))
+        self.assertNotIn("search_path", _block("t", "out/x.json", ["SELECT 1;"]))
+
+    def test_maintenance_steps_outside_a_transaction_also_get_the_search_path(self):
+        import tempfile
+        from explain_analyzer.experiments import generate
+        n = N("Index Only Scan", rows=5000, act=5000, **{"Heap Fetches": 5000, "Relation Name": "t"})
+        p, f, acts = actions_for(n)
+        with tempfile.TemporaryDirectory() as d:
+            generate(acts, d, relations=["t"])
+            sql = (Path(d) / "experiments.sql").read_text()
+        i = sql.index("VACUUM (ANALYZE) t;")
+        self.assertIn("SET search_path = :sp;", sql[:i][-80:])
+        self.assertIn("RESET search_path;", sql[i:i + 60])
+
+    def test_schema_option_qualifies_every_generated_statement(self):
+        (plan, findings), = analyze_text(json.dumps([{"Plan": self._scan_plan(), "Execution Time": 900.0}]),
+                                        schema="sales")
+        sql = sql_of(plan.m["actions"])
+        self.assertIn("CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_orders_status ON sales.orders (status);", sql)
+        self.assertIn("CREATE INDEX idx_orders_status ON sales.orders (status);", sql)
+
+    def test_schema_in_the_plan_wins_over_the_option_and_is_quoted_when_needed(self):
+        (plan, _), = analyze_text(json.dumps([{"Plan": self._scan_plan(Schema="My Schema"), "Execution Time": 900.0}]),
+                                  schema="ignored")
+        self.assertIn('ON "My Schema".orders (status)', sql_of(plan.m["actions"]))
+
+    def test_list_valued_settings_are_replayed_via_set_config_not_as_one_quoted_name(self):
+        import tempfile
+        from explain_analyzer.experiments import generate
+        with tempfile.TemporaryDirectory() as d:
+            generate([], d, settings={"search_path": "sales, public", "work_mem": "1GB"})
+            pre = (Path(d) / "preamble.sql").read_text()
+        self.assertIn("PERFORM set_config('search_path', 'sales, public', true);", pre)
+        self.assertNotIn("SET LOCAL search_path = 'sales, public'", pre)
+
+    def test_cli_schema_flag_and_note(self):
+        import io, contextlib, tempfile
+        with tempfile.TemporaryDirectory() as d:
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                rc = main([str(FIX / "real_nl.json"), "--schema", "sales", "--script", d, "--color", "never"])
+            self.assertEqual(rc, 0)
+            self.assertIn("sales.t", out.getvalue())
+            self.assertIn("schema sales", err.getvalue())
+        with tempfile.TemporaryDirectory() as d:
+            err = io.StringIO()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                main([str(FIX / "real_nl.json"), "--script", d, "--color", "never"])
+            self.assertIn("looks their schemas up in the database at run time", err.getvalue())

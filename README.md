@@ -22,7 +22,12 @@ nearly all of the gain. Details and the reasoning behind each action: [docs/opti
 `query.sql` is the statement the plan came from. It may start with `SET ...;` statements (they are replayed at the
 start of every experiment transaction, so each experiment runs under your settings) and may even start with
 `EXPLAIN ...` (stripped); only the **last** statement is explained. Non-default settings recorded in the plan
-(`EXPLAIN (SETTINGS)`) are replayed too, unless your file sets them itself. Experiments that need a setting the
+(`EXPLAIN (SETTINGS)`) are replayed too, unless your file sets them itself. **Schemas:** `EXPLAIN` omits the schema of any table that is on the capturing session's `search_path` (unless you use
+`VERBOSE`), and `psql -X` skips `~/.psqlrc`, where `search_path` is often set. The script therefore restores the
+`search_path` recorded in the plan's `Settings` and, if that is missing, looks the tables' schemas up in the database at
+run time. Pass `--schema NAME` to get schema-qualified SQL in the action plan (recommended for anything you will paste
+into production), or put `SET search_path = ...;` at the top of `query.sql`.
+Experiments that need a setting the
 server lacks (e.g. `hash_mem_multiplier` before PostgreSQL 13) are skipped instead of failing.
 
 `ANALYZE` **executes** the statement (DML is rolled back by the generated script). Run experiments on staging or a

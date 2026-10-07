@@ -81,8 +81,9 @@ class Remedy:
 
 
 class Ctx:
-    def __init__(self, plan: Plan, cfg: Config):
+    def __init__(self, plan: Plan, cfg: Config, default_schema: str | None = None):
         self.plan, self.cfg = plan, cfg
+        self.default_schema = default_schema
         self.remedies: dict[str, Remedy] = {}
         self.analyze: dict[str, set[int]] = {}          # table ref -> node ids needing fresh stats
         self.aliases: set[str] = set()
@@ -90,17 +91,21 @@ class Ctx:
         for n in plan.nodes:
             rel = n.get("Relation Name")
             if rel:
-                sch = n.get("Schema")
+                sch = self.sch(n)
                 for k in {n.get("Alias") or rel, rel}:
                     self.aliases.add(k)
                     self.by_alias.setdefault(k, (sch, rel))
 
     # -- naming helpers
+    def sch(self, node: Node) -> str | None:
+        """Schema of a scanned relation: from the plan (VERBOSE / not on search_path) or --schema."""
+        return node.get("Schema") or self.default_schema
+
     def table_ref(self, node: Node) -> tuple[str, str, str] | None:
         rel = node.get("Relation Name")
         if not rel:
             return None
-        sch = node.get("Schema")
+        sch = self.sch(node)
         full = f"{qi(sch)}.{qi(rel)}" if sch else qi(rel)
         return full, rel, node.get("Alias") or rel
 
@@ -109,7 +114,7 @@ class Ctx:
         for x in within.walk():
             rel = x.get("Relation Name")
             if rel and (alias is None or alias in (x.get("Alias"), rel)):
-                sch = x.get("Schema")
+                sch = self.sch(x)
                 return (f"{qi(sch)}.{qi(rel)}" if sch else qi(rel)), rel
         return None
 
@@ -134,7 +139,7 @@ class Ctx:
         for x in node.walk():
             rel = x.get("Relation Name")
             if rel and not x.is_subplan_child():
-                sch = x.get("Schema")
+                sch = self.sch(x)
                 ref = f"{qi(sch)}.{qi(rel)}" if sch else qi(rel)
                 self.analyze.setdefault(ref, set()).add(node.id)
 
@@ -589,8 +594,9 @@ def _investigate(ctx: Ctx, f: Finding, n: Node | None) -> None:
 
 # ----------------------------------------------------------------- driver
 
-def build_actions(plan: Plan, findings: list[Finding], cfg: Config) -> list[Remedy]:
-    ctx = Ctx(plan, cfg)
+def build_actions(plan: Plan, findings: list[Finding], cfg: Config,
+                  default_schema: str | None = None) -> list[Remedy]:
+    ctx = Ctx(plan, cfg, default_schema)
     by_id = {n.id: n for n in plan.nodes}
     for f in findings:
         n = by_id.get(f.node_id) if f.node_id else None

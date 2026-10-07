@@ -16,7 +16,7 @@ from .sanitize import Sanitizer
 
 
 def analyze_text(text: str, cfg: Config | None = None, sanitize: str | None = None,
-                 salt: str = "") -> list[tuple[Plan, list[Finding]]]:
+                 salt: str = "", schema: str | None = None) -> list[tuple[Plan, list[Finding]]]:
     """Parse + analyse. ``sanitize`` is None, 'literals' or 'names'."""
     cfg = cfg or Config()
     out = []
@@ -25,7 +25,7 @@ def analyze_text(text: str, cfg: Config | None = None, sanitize: str | None = No
         if sanitize:
             Sanitizer(names=sanitize == "names", salt=salt).plan(plan)
         findings = run_rules(plan, cfg)
-        plan.m["actions"] = build_actions(plan, findings, cfg)
+        plan.m["actions"] = build_actions(plan, findings, cfg, schema)
         out.append((plan, findings))
     return out
 
@@ -73,6 +73,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--script", metavar="DIR",
                     help="write DIR/experiments.sql: a psql script that tests every action inside "
                          "BEGIN...ROLLBACK and captures the resulting plans")
+    ap.add_argument("--schema", metavar="NAME",
+                    help="schema of the tables whose plan shows none (EXPLAIN omits the schema for tables on the "
+                         "search_path unless VERBOSE): makes all generated SQL schema-qualified")
     ap.add_argument("--query", metavar="FILE", help="the SQL statement the plan came from (copied into --script DIR)")
     ap.add_argument("--compare", nargs="+", metavar="PATH",
                     help="compare plans: a --script DIR, or BASELINE.json CANDIDATE.json [...]")
@@ -98,7 +101,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         cfg = Config.from_overrides(args.set)
         text = sys.stdin.read() if args.file == "-" else Path(args.file).read_text(encoding="utf-8", errors="replace")
-        results = analyze_text(text, cfg, args.sanitize, args.salt)
+        results = analyze_text(text, cfg, args.sanitize, args.salt, args.schema)
     except (ParseError, ValueError, OSError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
@@ -126,7 +129,8 @@ def main(argv: list[str] | None = None) -> int:
             from .experiments import generate
             d = Path(args.script) if len(results) == 1 else Path(args.script) / f"plan{i + 1}"
             try:
-                man = generate(plan.m.get("actions", []), d, args.query, args.file, plan.settings)
+                rels = sorted({n.get("Relation Name") for n in plan.nodes if n.get("Relation Name") and not n.get("Schema")})
+                man = generate(plan.m.get("actions", []), d, args.query, args.file, plan.settings, rels, args.schema)
             except (ValueError, OSError) as e:
                 print(f"error: {e}", file=sys.stderr)
                 return 1
