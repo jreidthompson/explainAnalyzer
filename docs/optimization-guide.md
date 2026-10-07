@@ -6,8 +6,8 @@ Everything the tool prints in its **Action plan** comes from this guide; sources
 ## 1. The loop (about five commands)
 
 ```
-# 1. capture - ANALYZE and BUFFERS are what the rules need; SETTINGS records work_mem etc.
-psql -X -At -d DB -c "EXPLAIN (ANALYZE, BUFFERS, SETTINGS, FORMAT JSON) <query>" > plan.json
+# 1. capture - ANALYZE+BUFFERS drive the rules; VERBOSE makes every table schema.table; SETTINGS records work_mem etc.
+psql -X -At -d DB -c "EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS, FORMAT JSON) <query>" > plan.json
 # 2. analyze: findings + a ranked, copy-pasteable Action plan
 python -m explain_analyzer plan.json --html report.html
 # 3. let the tool test every action for you (each runs inside BEGIN ... ROLLBACK)
@@ -108,9 +108,11 @@ measure real time.
 
 ## 5. Capturing good plans
 
-* Required: `ANALYZE`, `BUFFERS`. Recommended: `SETTINGS`, `FORMAT JSON`. `WAL`/`MEMORY` are harmless extras.
-* `VERBOSE` is optional: it adds per-node output column lists (large for wide rows). The analyzer qualifies bare
-  columns itself, so conditions stay readable without it.
+* Required: `ANALYZE`, `BUFFERS`. Recommended: `VERBOSE`, `SETTINGS`, `FORMAT JSON`. `WAL`/`MEMORY` are harmless extras.
+* **`VERBOSE` is how you make the plan declare `schema.table`.** Without it `EXPLAIN` leaves the schema off every table
+  that is on the capturing session's `search_path` (JSON has no `"Schema"` key at all), so generated SQL and the
+  experiment script cannot tell same-named tables in different schemas apart. It also adds per-node `Output:` column
+  lists, which make plans of wide rows large; the analyzer ignores them. If you cannot use `VERBOSE`, pass `--schema NAME`.
 * `track_io_timing = on` adds I/O timings to the BUFFERS output (it costs clock calls; test with `pg_test_timing`).
 * `TIMING OFF` reduces overhead on very large plans but removes the per-node times the time-based rules use.
 * A psql `.psqlrc` that prints `SET` lines before the plan is tolerated; `psql -X` skips it.

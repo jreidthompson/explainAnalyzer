@@ -785,3 +785,22 @@ class AmbiguousSchemaTests(unittest.TestCase):
         _, _, acts = actions_for(n, **{"Execution Time": 50.0})
         q = " ".join(" ".join(a.investigate_sql) for a in acts)
         self.assertIn("SELECT schemaname, relname", q)
+
+
+class VerboseSchemaTests(unittest.TestCase):
+    TEXT = ("Seq Scan on sales.orders o  (cost=0.00..10.00 rows=5 width=4) (actual time=0.1..0.2 rows=5 loops=1)\n"
+            "  Output: o.id\n  Filter: (o.status = 3)\n  Rows Removed by Filter: 900000\n"
+            "Execution Time: 900 ms\n")
+
+    def test_verbose_text_plan_carries_the_schema_into_generated_sql(self):
+        (plan, findings), = analyze_text(self.TEXT)
+        self.assertEqual(plan.root.get("Schema"), "sales")
+        self.assertIn("ON sales.orders (status)", sql_of(plan.m["actions"]))
+        self.assertNotIn("NOTE: the plan names no schema", report_text.render(plan, findings))
+
+    def test_plan_without_schema_gets_a_note_pointing_at_verbose_and_schema_flag(self):
+        (plan, findings), = analyze_text(self.TEXT.replace("sales.orders", "orders"))
+        out = report_text.render(plan, findings)
+        self.assertIn("NOTE: the plan names no schema for: orders", out)
+        self.assertIn("VERBOSE", out)
+        self.assertIn("--schema", out)

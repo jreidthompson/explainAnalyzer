@@ -32,6 +32,12 @@ def summary_lines(plan: Plan) -> list[str]:
         out.append("Buffers (root): " + ", ".join(f"{k.replace(' Blocks', '').lower()}={v:,}" for k, v in tot.items() if v))
     if not plan.m["analyzed"]:
         out.append("NOTE: no ANALYZE data - only cost-based checks were possible.")
+    bare = sorted({n.get("Relation Name") for n in plan.nodes if n.get("Relation Name") and not n.get("Schema")})
+    if bare:
+        shown = ", ".join(bare[:5]) + (f" (+{len(bare) - 5} more)" if len(bare) > 5 else "")
+        out.append(f"NOTE: the plan names no schema for: {shown}. EXPLAIN omits the schema of tables on the search_path; "
+                   "capture with EXPLAIN (ANALYZE, BUFFERS, VERBOSE, ...) so every table is schema.table, "
+                   "or pass --schema NAME.")
     return out
 
 
