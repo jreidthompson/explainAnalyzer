@@ -584,3 +584,74 @@ class ExperimentAndCompareTests(unittest.TestCase):
             self.assertIn("CREATE STATISTICS", buf.getvalue())
             self.assertTrue((Path(d) / "experiments.sql").exists())
             self.assertIn("--compare", err.getvalue())
+
+
+class QueryFileTests(unittest.TestCase):
+    def test_split_statements_respects_quotes_comments_and_dollar_quotes(self):
+        from explain_analyzer.querysplit import split_statements
+        sql = ("SET a = 'x;y'; -- trailing; comment\n/* block; */ SELECT $$a;b$$, \"c;d\" FROM t;\n"
+               "SELECT 'it''s;ok';  -- end")
+        self.assertEqual(split_statements(sql),
+                         ["SET a = 'x;y'",
+                          "-- trailing; comment\n/* block; */ SELECT $$a;b$$, \"c;d\" FROM t", "SELECT 'it''s;ok'"])
+
+    def test_set_statements_become_preamble_not_part_of_explain(self):
+        from explain_analyzer.querysplit import prepare
+        q = prepare("SET work_mem = '6GB';\nSET hash_mem_multiplier = 4;\nSELECT 1 FROM t WHERE a = 'x;y';\n")
+        self.assertEqual(q["main"], "SELECT 1 FROM t WHERE a = 'x;y'")
+        self.assertEqual(len(q["preamble"]), 2)
+        self.assertEqual(q["set_names"], {"work_mem", "hash_mem_multiplier"})
+
+    def test_pasted_explain_psql_commands_and_transaction_control_are_cleaned(self):
+        from explain_analyzer.querysplit import prepare
+        for pasted in ("EXPLAIN (ANALYZE, BUFFERS) SELECT 1;", "EXPLAIN ANALYZE VERBOSE SELECT 1;",
+                       "explain (analyze, format json) SELECT 1"):
+            self.assertEqual(prepare(pasted)["main"], "SELECT 1")
+        q = prepare("\\timing on\nBEGIN;\nSET x = 1;\nSELECT 2;\nCOMMIT;\nSELECT 3;")
+        self.assertEqual(q["main"], "SELECT 3")
+        self.assertEqual(q["preamble"], ["SET x = 1", "SELECT 2"])
+        self.assertTrue(any("meta-command" in n for n in q["notes"]))
+        self.assertTrue(any("BEGIN" in n for n in q["notes"]))
+
+    def test_leading_comments_do_not_hide_set_or_begin(self):
+        from explain_analyzer.querysplit import prepare
+        q = prepare("-- tuning\nSET work_mem = '1GB';\n/* tx */ BEGIN;\n-- the query\nSELECT 1;")
+        self.assertEqual(q["set_names"], {"work_mem"})
+        self.assertEqual(q["preamble"], ["-- tuning\nSET work_mem = '1GB'"])
+        self.assertTrue(any("BEGIN" in n for n in q["notes"]))
+        self.assertEqual(prepare("-- c\nEXPLAIN (ANALYZE) SELECT 1")["main"], "SELECT 1")
+
+    def test_unusable_query_files_are_rejected_with_a_clear_message(self):
+        from explain_analyzer.querysplit import prepare
+        for bad in ("", "-- only a comment\n", "SELECT 1;\nSET work_mem = '1GB';", "SELECT 1;\nCOMMIT;"):
+            with self.assertRaises(ValueError):
+                prepare(bad)
+
+    def test_script_replays_preamble_and_plan_settings_in_every_experiment(self):
+        import tempfile
+        from explain_analyzer.experiments import generate
+        with tempfile.TemporaryDirectory() as d:
+            qf = Path(d) / "q.sql"
+            qf.write_text("SET work_mem = '6GB';\nSELECT * FROM orders WHERE status = 3;\n")
+            n = N("Seq Scan", rows=10, act=10, total=900.0,
+                  **{"Relation Name": "orders", "Rows Removed by Filter": 5_000_000, "Filter": "(status = 3)"})
+            p, f, acts = actions_for(n, **{"Execution Time": 900.0,
+                                           "Settings": {"work_mem": "1GB", "random_page_cost": "1.1"}})
+            man = generate(acts, Path(d) / "exp", str(qf), "plan.json", p.settings)
+            exp = Path(d) / "exp"
+            pre = (exp / "preamble.sql").read_text()
+            self.assertIn("SET work_mem = '6GB';", pre)
+            self.assertIn("SET LOCAL random_page_cost = '1.1';", pre)
+            self.assertNotIn("SET LOCAL work_mem", pre)            # the query file already sets it
+            sql = (exp / "experiments.sql").read_text()
+            self.assertEqual(sql.count("\\i preamble.sql"), sql.count("BEGIN;"))
+            self.assertEqual((exp / "query.sql").read_text().strip(), "SELECT * FROM orders WHERE status = 3")
+            self.assertTrue(man["notes"])
+
+    def test_versioned_settings_are_guarded_so_old_servers_skip_instead_of_failing(self):
+        from explain_analyzer.experiments import _block
+        blk = _block("t", "out/x.json", ["SET LOCAL hash_mem_multiplier = 4;"])
+        self.assertIn("\\if :has_hash_mem_multiplier", blk)
+        self.assertIn("\\else", blk)
+        self.assertEqual(blk.count("\\if"), blk.count("\\endif"))
+        self.assertNotIn("\\if", _block("t", "out/x.json", ["SET LOCAL work_mem = '1GB';"]))

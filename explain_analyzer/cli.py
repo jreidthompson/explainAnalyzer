@@ -125,7 +125,13 @@ def main(argv: list[str] | None = None) -> int:
         if args.script:
             from .experiments import generate
             d = Path(args.script) if len(results) == 1 else Path(args.script) / f"plan{i + 1}"
-            man = generate(plan.m.get("actions", []), d, args.query, args.file)
+            try:
+                man = generate(plan.m.get("actions", []), d, args.query, args.file, plan.settings)
+            except (ValueError, OSError) as e:
+                print(f"error: {e}", file=sys.stderr)
+                return 1
+            for note in man.get("notes", []):
+                print(f"note: {note}", file=sys.stderr)
             print(f"\nwrote {d}/experiments.sql ({len(man['experiments'])} experiments). Next:\n"
                   f"  cd {d} && psql -X -d <database> -f experiments.sql\n"
                   f"  python -m explain_analyzer --compare {d}", file=sys.stderr)

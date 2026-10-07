@@ -13,10 +13,12 @@ FASTER, SLOWER = 0.90, 1.10     # outside this band vs baseline counts as a real
 
 def _load(path: Path, cfg: Config):
     from .cli import analyze_text
+    if not path.exists():
+        return None, "no output file (skipped: the server does not support a setting this experiment needs, or psql stopped early)"
     try:
         txt = path.read_text(encoding="utf-8", errors="replace")
         if not txt.strip():
-            return None, "empty output (the experiment failed - see psql's error message)"
+            return None, "empty output (the experiment failed or was skipped - see the error printed by psql)"
         (plan, findings), *_ = analyze_text(txt, cfg)
         return (plan, findings), None
     except Exception as e:  # noqa: BLE001 - report, don't crash the comparison

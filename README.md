@@ -19,6 +19,12 @@ a rollback-safe "try" version, a production "apply" version, cautions and what t
 `--script` runs all of them for you; `--compare` ranks the results and prints the smallest change that captures
 nearly all of the gain. Details and the reasoning behind each action: [docs/optimization-guide.md](docs/optimization-guide.md).
 
+`query.sql` is the statement the plan came from. It may start with `SET ...;` statements (they are replayed at the
+start of every experiment transaction, so each experiment runs under your settings) and may even start with
+`EXPLAIN ...` (stripped); only the **last** statement is explained. Non-default settings recorded in the plan
+(`EXPLAIN (SETTINGS)`) are replayed too, unless your file sets them itself. Experiments that need a setting the
+server lacks (e.g. `hash_mem_multiplier` before PostgreSQL 13) are skipped instead of failing.
+
 `ANALYZE` **executes** the statement (DML is rolled back by the generated script). Run experiments on staging or a
 replica copy: a plain `CREATE INDEX` blocks writes to its table while building.
 

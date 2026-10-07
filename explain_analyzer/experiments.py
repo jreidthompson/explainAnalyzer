@@ -10,7 +10,10 @@ Then:  explain-analyzer --compare <dir>
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
+
+from .querysplit import prepare
 
 from .remedies import Remedy
 
@@ -32,26 +35,75 @@ HEADER = """\
 """
 
 
-def _block(name: str, file: str, stmts: list[str]) -> str:
+# Settings that do not exist on older servers: the experiment is skipped there instead of failing.
+VERSIONED = {"hash_mem_multiplier": "PostgreSQL 13+", "jit": "PostgreSQL 11+"}
+
+
+def _needs(stmts: list[str]) -> list[str]:
+    found = []
+    for s in stmts:
+        m = re.match(r"\s*SET\s+(?:LOCAL\s+|SESSION\s+)?([A-Za-z_][\w.]*)", s, re.I)
+        if m and m.group(1).lower() in VERSIONED and m.group(1).lower() not in found:
+            found.append(m.group(1).lower())
+    return found
+
+
+def _block(name: str, file: str, stmts: list[str], preamble: bool = False) -> str:
     body = "\n".join(stmts)
-    return (f"\\echo >>> {name}\nBEGIN;\n{body}\n\\o {file}\n{EXPLAIN} :q\n;\n\\o\nROLLBACK;\n")
+    pre = "\\i preamble.sql\n" if preamble else ""
+    run = f"{pre}{body}\n\\o {file}\n{EXPLAIN} :q\n;\n\\o\n"
+    need = _needs(stmts)
+    if need:   # only run where every versioned setting exists
+        skip = "; ".join(f"{n} needs {VERSIONED[n]}" for n in need)
+        opens = "".join(f"\\if :has_{n}\n" for n in need)           # psql \if takes one value: nest them
+        closes = "".join("\\else\n" f"\\echo     skipped: {skip}\n\\endif\n" for _ in need)
+        run = f"{opens}{run}{closes}"
+    return f"\\echo >>> {name}\nBEGIN;\n{run}ROLLBACK;\n"
+
+
+def _sql_str(v) -> str:
+    return "'" + str(v).replace("'", "''") + "'"
 
 
 def generate(remedies: list[Remedy], outdir: str | Path, query_file: str | None = None,
-             source: str = "") -> dict:
+             source: str = "", settings: dict | None = None) -> dict:
     out = Path(outdir)
     (out / "out").mkdir(parents=True, exist_ok=True)
+    notes: list[str] = []
+    pre: list[str] = []
+    set_names: set[str] = set()
     if query_file:
-        (out / "query.sql").write_text(Path(query_file).read_text(encoding="utf-8"), encoding="utf-8")
+        q = prepare(Path(query_file).read_text(encoding="utf-8"))
+        (out / "query.sql").write_text(q["main"] + "\n", encoding="utf-8")
+        pre, notes, set_names = q["preamble"], q["notes"], q["set_names"]
     elif not (out / "query.sql").exists():
         (out / "query.sql").write_text("-- put the statement under test here (plain SQL, no EXPLAIN, no $1 parameters)\n",
                                        encoding="utf-8")
+    # replay the non-default settings the plan was captured under (EXPLAIN SETTINGS), unless the query file sets them
+    plan_sets = [f"SET LOCAL {k} = {_sql_str(v)};" for k, v in (settings or {}).items()
+                 if re.fullmatch(r"[A-Za-z_][\w.]*", str(k)) and str(k).lower() not in set_names]
+    if plan_sets:
+        notes.append(f"replaying {len(plan_sets)} non-default setting(s) recorded in the plan: "
+                     + ", ".join(s.split()[2] for s in plan_sets))
+    preamble_sql = [*(s.rstrip(";") + ";" for s in pre), *plan_sets]
+    has_pre = bool(preamble_sql)
+    if has_pre:
+        (out / "preamble.sql").write_text(
+            "-- Replayed at the start of every experiment transaction (after BEGIN).\n"
+            "-- Statements from your query file, then settings recorded in the plan.\n"
+            + "\n".join(preamble_sql) + "\n", encoding="utf-8")
+    elif (out / "preamble.sql").exists():
+        (out / "preamble.sql").unlink()
 
-    parts = [HEADER]
-    manifest = {"source_plan": source, "baseline": "out/baseline.json", "experiments": [], "skipped": []}
+    parts = [HEADER.replace("\\set q `cat query.sql`\n",
+                            "\\set q `cat query.sql`\n"
+                            "SELECT (current_setting('hash_mem_multiplier', true) IS NOT NULL) AS has_hash_mem_multiplier \\gset\n"
+                            "SELECT (current_setting('jit', true) IS NOT NULL) AS has_jit \\gset\n")]
+    manifest = {"source_plan": source, "baseline": "out/baseline.json", "experiments": [], "skipped": [],
+                "notes": notes}
     parts.append("-- warm-up run (result discarded): warms the cache so later runs are comparable\n")
-    parts.append(_block("warm-up", "out/warmup.json", ["-- (no changes)"]))
-    parts.append(_block("baseline", "out/baseline.json", ["-- (no changes)"]))
+    parts.append(_block("warm-up", "out/warmup.json", ["-- (no changes)"], has_pre))
+    parts.append(_block("baseline", "out/baseline.json", ["-- (no changes)"], has_pre))
 
     combo: list[str] = []
     for r in remedies:
@@ -64,9 +116,9 @@ def generate(remedies: list[Remedy], outdir: str | Path, query_file: str | None 
             title = f"{r.id} {r.title} [{label}]"
             if not r.transactional:
                 parts.append(f"\\echo >>> {r.id}: NOT ROLLED BACK (maintenance)\n" + "\n".join(stmts) + "\n")
-                parts.append(_block(f"{title} (after maintenance)", fname, ["-- (maintenance applied above)"]))
+                parts.append(_block(f"{title} (after maintenance)", fname, ["-- (maintenance applied above)"], has_pre))
             else:
-                parts.append(_block(title, fname, stmts))
+                parts.append(_block(title, fname, stmts, has_pre))
             manifest["experiments"].append({
                 "id": f"{r.id}_{i}", "remedy": r.id, "title": r.title, "variant": label, "file": fname,
                 "kind": r.kind, "stage": r.stage, "apply": r.apply, "diagnostic_only": r.diagnostic_only,
@@ -77,7 +129,7 @@ def generate(remedies: list[Remedy], outdir: str | Path, query_file: str | None 
     structural = [r for r in remedies if r.transactional and not r.diagnostic_only
                   and r.kind in ("index", "statistics", "maintenance") and r.try_variants]
     if len(structural) >= 2:
-        parts.append(_block("COMBINED: all index/statistics/ANALYZE actions together", "out/combined.json", combo))
+        parts.append(_block("COMBINED: all index/statistics/ANALYZE actions together", "out/combined.json", combo, has_pre))
         manifest["experiments"].append({
             "id": "combined", "remedy": ",".join(r.id for r in structural),
             "title": "All index/statistics/ANALYZE actions together", "variant": "combined",
